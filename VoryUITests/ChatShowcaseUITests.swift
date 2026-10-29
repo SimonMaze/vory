@@ -286,4 +286,22 @@ final class ChatShowcaseUITests: XCTestCase {
             sleep(1); shot("27-bots-room")
         }
     }
+
+    /// A native A2UI card: the mock's "a2ui" prompt streams a booking form.
+    func testA2UICard() throws {
+        guard let (url, token) = env else { throw XCTSkip("HERMES_E2E_URL / HERMES_E2E_TOKEN not set") }
+        connectIfNeeded(url: url, token: token)
+        let newChat = app.buttons["chats.new"].firstMatch
+        XCTAssertTrue(newChat.waitForExistence(timeout: 30))
+        wait(for: [expectation(for: NSPredicate(format: "isEnabled == true"), evaluatedWith: newChat)], timeout: 60)
+        newChat.tap()
+        let composer = app.descendants(matching: .any).matching(identifier: "composer.text").firstMatch
+        XCTAssertTrue(composer.waitForExistence(timeout: 30))
+        composer.tap()
+        composer.typeText("a2ui")
+        app.buttons["composer.send"].firstMatch.tap()
+        XCTAssertTrue(waitForText("When should we book", timeout: 30), "the a2ui card never appeared")
+        sleep(1)
+        shot("28-a2ui-card")
+    }
 }

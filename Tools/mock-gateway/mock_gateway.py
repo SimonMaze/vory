@@ -7,7 +7,9 @@ reasoning.delta / reasoning.available / thinking.delta, tool.start/complete, an 
 server->client request, session.usage ticks, message.complete). No AI provider, no API keys,
 no network calls. A prompt containing "think it through" gets a reply that thinks first; one
 containing "power rankings" gets a web search and an answer sent only as reasoning. A prompt
-starting "tools" gets a long turn of a dozen tool calls (the thread's layout checks). In a group
+starting "tools" gets a long turn of a dozen tool calls (the thread's layout checks). One
+starting "a2ui" answers with a native card; a prompt carrying an a2ui-action fence confirms it.
+In a group
 chat of two or more bots, a message with @all or @everyone opens every bot's turn at once, so
 they are seen working side by side before each answers.
 
@@ -259,6 +261,23 @@ new Chart(document.getElementById('c'), {type: 'line', data: {labels: ['Mon','Tu
 </script>"""
 
 CARD_PART_2 = """nginx is still the one growing. Say the word and I'll set its logrotate to `rotate 8`."""
+
+# "a2ui": a native card (a small booking form). "card" stays the HTML card the existing
+# screenshots drive. A later prompt that carries the app's ```a2ui-action fence is the reply.
+A2UI_PART_1 = "Pick a time and I'll book it."
+A2UI_JSON = """[
+{"version":"v0.9","createSurface":{"surfaceId":"booking","catalogId":"https://a2ui.org/specification/v0_9/basic_catalog.json","sendDataModel":true}},
+{"version":"v0.9","updateComponents":{"surfaceId":"booking","components":[
+{"id":"root","component":"Column","children":["title","when","guests","book"]},
+{"id":"title","component":"Text","text":"When should we book","variant":"h4"},
+{"id":"when","component":"ChoicePicker","label":"Day","value":{"path":"/date"},"variant":"mutuallyExclusive","displayStyle":"chips","options":[{"label":"Tuesday","value":"Tuesday"},{"label":"Wednesday","value":"Wednesday"}]},
+{"id":"guests","component":"TextField","label":"Guests","value":{"path":"/guests"}},
+{"id":"book","component":"Button","child":"bookLabel","variant":"primary","action":{"event":{"name":"book","context":{"date":{"path":"/date"},"guests":{"path":"/guests"}}}}},
+{"id":"bookLabel","component":"Text","text":"Book"}
+]}},
+{"version":"v0.9","updateDataModel":{"surfaceId":"booking","value":{"date":["Tuesday"],"guests":"2"}}}
+]"""
+A2UI_PART_2 = "The form stays on the card until you send it."
 
 TABLE_REPLY = """## What is using the disk
 
@@ -2020,6 +2039,31 @@ class Gateway:
         s.inflight = None
         await self.event("message.complete", s.sid, {"text": full, "status": "complete", "usage": usage(s.output_tokens, 1)})
 
+    async def _a2ui_turn(self, s: Session, prompt: str) -> None:
+        """A reply with a native A2UI card: a fenced a2ui block between two paragraphs."""
+        await self.event("message.start", s.sid)
+        await self.stream_words(s, A2UI_PART_1)
+        await self.stream_words(s, "\n\n```a2ui\n" + A2UI_JSON + "\n```\n\n", delay=0.004)
+        await self.stream_words(s, A2UI_PART_2)
+        full = A2UI_PART_1 + "\n\n```a2ui\n" + A2UI_JSON + "\n```\n\n" + A2UI_PART_2
+        await self.echo_reasoning(s, full)
+        await self.event("session.usage", s.sid, {"usage": usage(s.output_tokens)})
+        self.store_turn(s, prompt, [full])
+        s.inflight = None
+        await self.event("message.complete", s.sid, {"text": full, "status": "complete", "usage": usage(s.output_tokens, 1)})
+
+    async def _a2ui_action_turn(self, s: Session, prompt: str) -> None:
+        """The person answered a native card: confirm the action it named."""
+        found = re.search(r'"name"\s*:\s*"([^"]+)"', prompt)
+        name = found.group(1) if found else "that"
+        await self.event("message.start", s.sid)
+        text = f"Got it — **{name}** is in. I'll take it from here."
+        await self.stream_words(s, text)
+        await self.echo_reasoning(s, text)
+        self.store_turn(s, prompt, [text])
+        s.inflight = None
+        await self.event("message.complete", s.sid, {"text": text, "status": "complete", "usage": usage(s.output_tokens, 1)})
+
     async def _delegate_turn(self, s: Session, prompt: str) -> None:
         """A turn that hands part of the work to two helpers: the `subagent.*` events the
         gateway raises on the parent's session (payload fields as its `_SUBAGENT_FIELDS`),
@@ -2411,6 +2455,12 @@ class Gateway:
             return
         if prompt.strip().lower().startswith("morph"):
             await self._morph_turn(s, prompt)
+            return
+        if "```a2ui-action" in prompt:
+            await self._a2ui_action_turn(s, prompt)
+            return
+        if prompt.strip().lower().startswith("a2ui"):
+            await self._a2ui_turn(s, prompt)
             return
         if prompt.strip().lower().startswith("card") or prompt.strip().lower().startswith("chart"):
             await self._card_turn(s, prompt)

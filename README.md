@@ -134,6 +134,11 @@ Plain `http://` is permitted (needed for LAN installs); the form warns when the 
   Tool cards show the command and output as capped code blocks; a `todo` tool call draws as a checklist.
   Appearance › Chat has the display options: fold tool cards after the turn, hide tool output, compact cards,
   current step only, wide replies and a text size.
+- **Cards**: a fenced `html` block draws as a sandboxed web card (Show Source turns it back into code). A fenced
+  `a2ui` block draws as native controls — text, fields, choices, a button — from the A2UI basic catalog. A button
+  sends a user turn: a sentence ("Chose \"book\" on the card: …") and a fenced `a2ui-action` block with the same
+  action as JSON. The card shows Answered once that turn is in the thread, and it cannot answer an approval.
+  The vory-push companion ships a `vory-cards` skill that teaches a bot the fence.
 - **Bot-to-bot messages**: when a bot messages another (a quiet `hermes -p <bot> chat … -q "Message from …"`
   run through the terminal tool, or the `message_agent` tool), the chat shows a centred "Messaging X…", then
   "Messaged X", then "Message from X" with the answer folded under it, instead of a shell transcript. Inbound

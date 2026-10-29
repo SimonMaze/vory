@@ -522,6 +522,7 @@ extension TranscriptView {
         actions.onKeepRunning = { showAwayGrace = true }
         actions.onSelectText = { selectText = SelectTextItem(text: $0) }
         actions.onShowAll = { title, text in selectText = SelectTextItem(title: title, text: text, monospaced: title.hasPrefix("Code")) }
+        actions.onCardAction = { text in Task { await chat.send(text) } }
         // Called inside the card's own animation: the hold and the change land in one update (`holdCard`).
         actions.setReasoningOpen = { id, on in holdCard(opening: on); if on { openReasoning.insert(id) } else { openReasoning.remove(id) } }
         actions.setToolOpen = { id, on in holdCard(opening: on); if on { openTools.insert(id) } else { openTools.remove(id) } }
@@ -529,7 +530,8 @@ extension TranscriptView {
                           botLabel: chat.runtime.profiles.first { $0.name == chat.profileName }?.label ?? chat.profileName, typingTool: typingTool, showReasoning: showReasoning, currentStepOnly: currentStepOnly,
                           showStats: showTurnStats, interruptCause: chat.interruptCause, lastID: chat.items.last?.id,
                           openReasoning: openReasoning, openTools: openTools, showToolOutput: showToolOutput, compactTools: compactTools,
-                          wide: wideReplies, maxBubble: bubbleCap, actions: actions)
+                          wide: wideReplies, maxBubble: bubbleCap, actions: actions,
+                          answeredSurfaces: A2UICard.answeredSurfaceIDs(in: chat.items), surfaces: rowCache.surfaces)
     }
 
     /// A card opening or closing keeps its place: for the length of the toggle's animation the thread's size changes
@@ -846,6 +848,8 @@ final class RowActions {
     var onSelectText: (String) -> Void = { _ in }
     /// The whole of a text a fold shows only the start of, on the Select Text sheet under a title (#361).
     var onShowAll: (_ title: String, _ text: String) -> Void = { _, _ in }
+    /// A card action, already a user turn (a sentence plus its a2ui-action fence).
+    var onCardAction: (String) -> Void = { _ in }
     var setReasoningOpen: (String, Bool) -> Void = { _, _ in }
     var setToolOpen: (String, Bool) -> Void = { _, _ in }
 }
@@ -875,12 +879,18 @@ struct RowContext: Equatable {
     var wide: Bool
     var maxBubble: CGFloat
     var actions: RowActions
+    /// Surfaces whose card the person already answered, from later user turns.
+    var answeredSurfaces: Set<String> = []
+    /// The thread's A2UI surfaces. Nil in tests that build a context by hand; one object for a
+    /// thread's life, so it compares by identity (two nils are equal).
+    var surfaces: A2UISurfaceCache? = nil
 
     static func == (a: RowContext, b: RowContext) -> Bool {
-        a.actions === b.actions && a.profile == b.profile && a.bot == b.bot && a.botLabel == b.botLabel && a.typingTool == b.typingTool && a.showReasoning == b.showReasoning
+        a.actions === b.actions && a.surfaces === b.surfaces && a.profile == b.profile && a.bot == b.bot && a.botLabel == b.botLabel && a.typingTool == b.typingTool && a.showReasoning == b.showReasoning
             && a.currentStepOnly == b.currentStepOnly && a.showStats == b.showStats && a.interruptCause == b.interruptCause && a.lastID == b.lastID
             && a.openReasoning == b.openReasoning && a.openTools == b.openTools && a.showToolOutput == b.showToolOutput
             && a.compactTools == b.compactTools && a.wide == b.wide && a.maxBubble == b.maxBubble
+            && a.answeredSurfaces == b.answeredSurfaces
     }
 
     /// The tool name for the typing bubble, given only to the row that draws it: a reply with no words yet, still
@@ -895,6 +905,13 @@ struct RowContext: Equatable {
 
     /// Why the turn was cut short, for the last row only: the others get nil and stay equal when a new row arrives.
     func interruptCause(for id: String) -> InterruptedTurn.Cause? { id == lastID ? interruptCause : nil }
+
+    /// The answered surfaces this row's own cards declared. Empty for every other row, so a reply
+    /// to one card does not rebuild the rest of the thread.
+    func cardAnswers(for item: TranscriptItem) -> Set<String> {
+        guard !answeredSurfaces.isEmpty, case .assistant(let text, _, _) = item.kind, text.contains("```a2ui") else { return [] }
+        return A2UICard.surfaceIDs(in: text).intersection(answeredSurfaces)
+    }
 
     /// The context the older, lazy rows are drawn with: what only the thread's last row uses left out (the typing
     /// bubble's tool, which row is last, why a turn was cut short). An older row is never the last one. With them in,
@@ -927,7 +944,8 @@ struct RowContext: Equatable {
                       onSelectText: actions.onSelectText,
                       onShowAll: actions.onShowAll, botLabel: botLabel,
                       toolOpen: openTools.contains(id), setToolOpen: { actions.setToolOpen(id, $0) },
-                      showToolOutput: showToolOutput, compactTools: compactTools, wide: wide, maxBubble: maxBubble)
+                      showToolOutput: showToolOutput, compactTools: compactTools, wide: wide, maxBubble: maxBubble,
+                      cardAnswers: cardAnswers(for: row.item), surfaces: surfaces, onCardAction: actions.onCardAction)
             // Equatable on what it draws (the closures and the binding are
             // compared by value): a row whose message did not change is not
             // rebuilt when the thread re-evaluates for a scroll or a token.
@@ -1217,6 +1235,8 @@ enum ChatStyle {
     }
     private var key: Key?
     private var built: [TranscriptRowModel] = []
+    /// A2UI surfaces for this thread: a row that scrolls off keeps what was typed into its card.
+    let surfaces = A2UISurfaceCache()
     private(set) var builds = 0
     private var olderSplit: Int?
     private var older: [TranscriptRowModel] = []
@@ -1356,6 +1376,7 @@ struct TranscriptRow: View, Equatable {
             && a.reasoningOpen == b.reasoningOpen && a.toolOpen == b.toolOpen
             && a.showToolOutput == b.showToolOutput && a.compactTools == b.compactTools && a.wide == b.wide
             && a.maxBubble == b.maxBubble && a.interruptCause == b.interruptCause
+            && a.cardAnswers == b.cardAnswers && a.surfaces === b.surfaces
     }
     var item: TranscriptItem
     /// The bot beside its bubble, as in a group chat; nil for none. Only the last bubble of a
@@ -1401,6 +1422,10 @@ struct TranscriptRow: View, Equatable {
     var wide = false
     /// The widest a bubble or card may be (the Mac's share of the reading column).
     var maxBubble: CGFloat = .infinity
+    /// Answered A2UI surfaces in this row's reply. Empty on every other row.
+    var cardAnswers: Set<String> = []
+    var surfaces: A2UISurfaceCache?
+    var onCardAction: (String) -> Void = { _ in }
     @Environment(\.colorScheme) private var scheme
 
     var body: some View {
@@ -1451,23 +1476,29 @@ struct TranscriptRow: View, Equatable {
                     let shownText = attached.isEmpty ? text : MediaScan.userTextWithoutAttachments(text)
                     if !attachments.isEmpty { AttachmentStrip(attachments: attachments) }
                     if !attached.isEmpty { MediaThumbStrip(refs: attached, profile: bot, side: 120, alignment: .trailing) }
-                    if !shownText.isEmpty {
-                        let shown = TextPieces.capped(shownText)
+                    let display = A2UICard.userDisplay(shownText)
+                    let visible = display.replied ? display.prose : shownText
+                    if !visible.isEmpty {
+                        let shown = TextPieces.capped(visible)
                         VStack(alignment: .leading, spacing: 6) {
                             LongText(shown.text)
-                            if shown.more > 0 { MoreTextNote(more: shown.more) { onShowAll("Your message", text) } }
+                            if shown.more > 0 { MoreTextNote(more: shown.more) { onShowAll("Your message", visible) } }
                         }
                             .textSelection(.enabled)
                             .fixedSize(horizontal: false, vertical: true)
                             .padding(.horizontal, 14).padding(.vertical, 9)
                             .foregroundStyle(.white)
                             .bubble(AppTheme.current, side: .trailing, tailed: botShown && bubbleStyle == "tailed") {
-                                Button { UIPasteboard.general.string = text } label: { Label("Copy", systemImage: "doc.on.doc") }
-                                Button { onSelectText(text) } label: { Label("Select Text", systemImage: "selection.pin.in.out") }
+                                Button { UIPasteboard.general.string = visible } label: { Label("Copy", systemImage: "doc.on.doc") }
+                                Button { onSelectText(visible) } label: { Label("Select Text", systemImage: "selection.pin.in.out") }
                                 Button { onEdit(text) } label: { Label("Edit & resend", systemImage: "pencil") }
-                                Button { onReply(text) } label: { Label("Reply", systemImage: "arrowshape.turn.up.left") }
-                                ShareLink(item: text) { Label("Share", systemImage: "square.and.arrow.up") }
+                                Button { onReply(visible) } label: { Label("Reply", systemImage: "arrowshape.turn.up.left") }
+                                ShareLink(item: visible) { Label("Share", systemImage: "square.and.arrow.up") }
                             }
+                    }
+                    if display.replied {
+                        Label("Replied to a card", systemImage: "rectangle.on.rectangle")
+                            .font(.caption2).foregroundStyle(.secondary)
                     }
                 }
             }
@@ -1516,7 +1547,7 @@ struct TranscriptRow: View, Equatable {
                     let media = TranscriptMedia.images(in: text)
                     // Other files the bot hands back are cards under the words (#309).
                     let files = TranscriptMedia.files(in: text)
-                    MarkdownView(text: media.isEmpty && files.isEmpty ? text : MediaScan.textWithoutMedia(text), inlineSelection: false, onShowAll: onShowAll).equatable()
+                    MarkdownView(text: media.isEmpty && files.isEmpty ? text : MediaScan.textWithoutMedia(text), inlineSelection: false, onShowAll: onShowAll, rowID: item.id, cardAnswers: cardAnswers, surfaceCache: surfaces, onCardAction: onCardAction).equatable()
                     if !media.isEmpty { MediaThumbStrip(refs: media, profile: bot) }
                     if !files.isEmpty { FileCardStrip(refs: files, profile: bot) }
                     if showStats, let s = item.stats {
@@ -2147,6 +2178,13 @@ struct MarkdownView: View, Equatable {
     var inlineSelection = true
     /// A code block's whole text on the Select Text sheet, under a title, when the reply shows only its start (#361).
     var onShowAll: ((_ title: String, _ text: String) -> Void)? = nil
+    /// The transcript row this markdown belongs to, so a card's form state has a stable key.
+    var rowID: String = ""
+    /// Surfaces in this reply the person already answered.
+    var cardAnswers: Set<String> = []
+    var surfaceCache: A2UISurfaceCache?
+    /// A card action, as the user turn to send.
+    var onCardAction: (String) -> Void = { _ in }
 
     /// A code block's sheet title: "Code", or "Code · bash" when the fence names a language.
     static func codeTitle(_ lang: String?) -> String {
@@ -2154,7 +2192,9 @@ struct MarkdownView: View, Equatable {
         return "Code · \(lang)"
     }
 
-    static func == (a: MarkdownView, b: MarkdownView) -> Bool { a.text == b.text && a.style == b.style && a.inlineSelection == b.inlineSelection }
+    static func == (a: MarkdownView, b: MarkdownView) -> Bool {
+        a.text == b.text && a.style == b.style && a.inlineSelection == b.inlineSelection && a.rowID == b.rowID && a.cardAnswers == b.cardAnswers && a.surfaceCache === b.surfaceCache
+    }
 
     var body: some View {
         let _ = Perf.tick("markdown")
@@ -2200,35 +2240,20 @@ struct MarkdownView: View, Equatable {
                     Button { withAnimation(.snappy) { _ = sourceShown.insert(index) } } label: { Label("Show Source", systemImage: "chevron.left.forwardslash.chevron.right") }
                     Button { UIPasteboard.general.string = code } label: { Label("Copy HTML", systemImage: "doc.on.doc") }
                 }
-        case .code(let lang, let code, let closed):
-            // Wrapped, not side-scrolling: code is read down the page and copied whole, so long
-            // lines wrap rather than hide past the edge (tables are what scroll sideways, and the
-            // time reveal stands aside for them). A copy button sits in the corner.
-            VStack(alignment: .leading, spacing: 0) {
-                HStack {
-                    if let lang, !lang.isEmpty { Text(lang).font(.caption2).foregroundStyle(.secondary) }
-                    Spacer(minLength: 0)
-                    if style.showsCards, closed, HTMLCard.isCard(language: lang) {
-                        Button { withAnimation(.snappy) { _ = sourceShown.remove(index) } } label: {
-                            Label("Show Card", systemImage: "rectangle.on.rectangle").font(.caption2).labelStyle(.titleAndIcon)
-                        }
-                        .buttonStyle(.plain).foregroundStyle(.tint).padding(.trailing, 6)
+        case .code(let lang, let code, let closed) where style.showsCards && closed && A2UICard.isCard(language: lang) && !sourceShown.contains(index):
+            // A native card, once its fence has closed. Without the thread's surface cache (a
+            // bot's notes, a board) it stays the code block below.
+            if let surfaceCache {
+                A2UICardView(source: code, cacheKey: "\(rowID)#\(index)", cache: surfaceCache, answeredSurfaces: cardAnswers, onAction: onCardAction, onShowSource: { withAnimation(.snappy) { _ = sourceShown.insert(index) } })
+                    .contextMenu {
+                        Button { withAnimation(.snappy) { _ = sourceShown.insert(index) } } label: { Label("Show Source", systemImage: "chevron.left.forwardslash.chevron.right") }
+                        Button { UIPasteboard.general.string = code } label: { Label("Copy JSON", systemImage: "doc.on.doc") }
                     }
-                    if closed { CopyButton(text: code) } else { ProgressView().controlSize(.mini) }
-                }
-                .padding(.horizontal, 10).padding(.top, 6)
-                // Its start, in pieces: every piece is drawn whole, so a log of thousands of lines cost hundreds of
-                // megabytes; the rest is a Show all away (#361).
-                let shown = TextPieces.capped(code)
-                LongText(shown.text, code: true).font(style.codeFont).textSelection(.enabled)
-                    .fixedSize(horizontal: false, vertical: true).padding(10)
-                if shown.more > 0 {
-                    MoreTextNote(more: shown.more, action: onShowAll.map { f in { f(Self.codeTitle(lang), code) } })
-                        .padding(.horizontal, 10).padding(.bottom, 8)
-                }
+            } else {
+                codeBlock(language: lang, code: code, closed: closed, at: index)
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(Color(.secondarySystemBackground), in: .rect(cornerRadius: 10))
+        case .code(let lang, let code, let closed):
+            codeBlock(language: lang, code: code, closed: closed, at: index)
         case .list(let items):
             VStack(alignment: .leading, spacing: 4) {
                 ForEach(Array(items.enumerated()), id: \.offset) { _, it in
@@ -2253,6 +2278,36 @@ struct MarkdownView: View, Equatable {
         case .rule:
             Divider()
         }
+    }
+
+    /// Wrapped, not side-scrolling: code is read down the page and copied whole, so long lines
+    /// wrap rather than hide past the edge. A closed html or a2ui fence offers Show Card.
+    @ViewBuilder private func codeBlock(language lang: String?, code: String, closed: Bool, at index: Int) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack {
+                if let lang, !lang.isEmpty { Text(lang).font(.caption2).foregroundStyle(.secondary) }
+                Spacer(minLength: 0)
+                if style.showsCards, closed, HTMLCard.isCard(language: lang) || (A2UICard.isCard(language: lang) && surfaceCache != nil) {
+                    Button { withAnimation(.snappy) { _ = sourceShown.remove(index) } } label: {
+                        Label("Show Card", systemImage: "rectangle.on.rectangle").font(.caption2).labelStyle(.titleAndIcon)
+                    }
+                    .buttonStyle(.plain).foregroundStyle(.tint).padding(.trailing, 6)
+                }
+                if closed { CopyButton(text: code) } else { ProgressView().controlSize(.mini) }
+            }
+            .padding(.horizontal, 10).padding(.top, 6)
+            // Its start, in pieces: every piece is drawn whole, so a log of thousands of lines cost hundreds of
+            // megabytes; the rest is a Show all away (#361).
+            let shown = TextPieces.capped(code)
+            LongText(shown.text, code: true).font(style.codeFont).textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true).padding(10)
+            if shown.more > 0 {
+                MoreTextNote(more: shown.more, action: onShowAll.map { f in { f(Self.codeTitle(lang), code) } })
+                    .padding(.horizontal, 10).padding(.bottom, 8)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color(.secondarySystemBackground), in: .rect(cornerRadius: 10))
     }
 }
 

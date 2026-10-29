@@ -25,6 +25,10 @@
 		AA00000000000000000403 /* VoryCore in Frameworks */ = {isa = PBXBuildFile; productRef = AA00000000000000000401 /* VoryCore */; };
 		AA00000000000000000410 /* VoryMacWidgets.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = AA00000000000000000421 /* VoryMacWidgets.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 		AA00000000000000000501 /* VoryCore in Frameworks */ = {isa = PBXBuildFile; productRef = AA00000000000000000502 /* VoryCore */; };
+		AA00000000000000000711 /* A2UISwiftUI in Frameworks */ = {isa = PBXBuildFile; productRef = AA00000000000000000701 /* A2UISwiftUI */; };
+		AA00000000000000000712 /* A2UISwiftUI in Frameworks */ = {isa = PBXBuildFile; productRef = AA00000000000000000702 /* A2UISwiftUI */; };
+		AA00000000000000000713 /* A2UISwiftUI in Frameworks */ = {isa = PBXBuildFile; productRef = AA00000000000000000703 /* A2UISwiftUI */; };
+		AA00000000000000000714 /* A2UISwiftUI in Frameworks */ = {isa = PBXBuildFile; productRef = AA00000000000000000704 /* A2UISwiftUI */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -416,6 +420,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				AA000000000000000000C3 /* VoryCore in Frameworks */,
+				AA00000000000000000711 /* A2UISwiftUI in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -432,6 +437,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				AA000000000000000000C4 /* VoryCore in Frameworks */,
+				AA00000000000000000713 /* A2UISwiftUI in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -479,6 +485,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				AA00000000000000000203 /* VoryCore in Frameworks */,
+				AA00000000000000000712 /* A2UISwiftUI in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -503,6 +510,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				AA00000000000000000501 /* VoryCore in Frameworks */,
+				AA00000000000000000714 /* A2UISwiftUI in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -584,6 +592,7 @@
 			name = Vory;
 			packageProductDependencies = (
 				AA000000000000000000C1 /* VoryCore */,
+				AA00000000000000000701 /* A2UISwiftUI */,
 			);
 			productName = Vory;
 			productReference = AA00000000000000000020 /* Vory.app */;
@@ -633,6 +642,7 @@
 			name = VoryTests;
 			packageProductDependencies = (
 				AA000000000000000000C2 /* VoryCore */,
+				AA00000000000000000703 /* A2UISwiftUI */,
 			);
 			productName = VoryTests;
 			productReference = AA00000000000000000022 /* VoryTests.xctest */;
@@ -783,6 +793,7 @@
 			name = VoryMac;
 			packageProductDependencies = (
 				AA00000000000000000201 /* VoryCore */,
+				AA00000000000000000702 /* A2UISwiftUI */,
 			);
 			productName = VoryMac;
 			productReference = AA00000000000000000220 /* Vory.app */;
@@ -857,6 +868,7 @@
 			name = VoryMacTests;
 			packageProductDependencies = (
 				AA00000000000000000502 /* VoryCore */,
+				AA00000000000000000704 /* A2UISwiftUI */,
 			);
 			productName = VoryMacTests;
 			productReference = AA00000000000000000520 /* VoryMacTests.xctest */;
@@ -894,6 +906,7 @@
 			minimizedProjectReferenceProxies = 1;
 			packageReferences = (
 				AA000000000000000000C0 /* XCLocalSwiftPackageReference "Packages/VoryCore" */,
+				AA00000000000000000700 /* XCRemoteSwiftPackageReference "a2ui-swift" */,
 			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = AA00000000000000000070 /* Products */;
@@ -1179,6 +1192,7 @@
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				COPY_PHASE_STRIP = NO;
 				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_CODE_COVERAGE = NO;
 				ENABLE_DEBUG_DYLIB = NO;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
 				ENABLE_TESTABILITY = YES;
@@ -1249,6 +1263,7 @@
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				COPY_PHASE_STRIP = NO;
 				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_CODE_COVERAGE = NO;
 				ENABLE_NS_ASSERTIONS = NO;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
 				ENABLE_USER_SCRIPT_SANDBOXING = YES;
@@ -1284,7 +1299,7 @@
 				CODE_SIGN_ENTITLEMENTS = Vory/Vory.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = 4PLALDQ8V8;
+				DEVELOPMENT_TEAM = X4W3XGG69K;
 				ENABLE_DEBUG_DYLIB = NO;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = NO;
@@ -1294,7 +1309,7 @@
 					"@executable_path/Frameworks",
 				);
 				MARKETING_VERSION = 1.5;
-				PRODUCT_BUNDLE_IDENTIFIER = com.vorantx.vory;
+				PRODUCT_BUNDLE_IDENTIFIER = com.maze.vory;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
 				SUPPORTS_MACCATALYST = NO;
@@ -1311,7 +1326,7 @@
 				CODE_SIGN_ENTITLEMENTS = Vory/Vory.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = 4PLALDQ8V8;
+				DEVELOPMENT_TEAM = X4W3XGG69K;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = Vory/Info.plist;
@@ -1320,7 +1335,7 @@
 					"@executable_path/Frameworks",
 				);
 				MARKETING_VERSION = 1.5;
-				PRODUCT_BUNDLE_IDENTIFIER = com.vorantx.vory;
+				PRODUCT_BUNDLE_IDENTIFIER = com.maze.vory;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
 				SUPPORTS_MACCATALYST = NO;
@@ -2014,6 +2029,17 @@
 		};
 /* End XCLocalSwiftPackageReference section */
 
+/* Begin XCRemoteSwiftPackageReference section */
+		AA00000000000000000700 /* XCRemoteSwiftPackageReference "a2ui-swift" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/BBC6BAE9/a2ui-swift";
+			requirement = {
+				kind = revision;
+				revision = 4af5dda15dd050e091a80026b940cd41f8d5b93c;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
 /* Begin XCSwiftPackageProductDependency section */
 		AA000000000000000000C1 /* VoryCore */ = {
 			isa = XCSwiftPackageProductDependency;
@@ -2058,6 +2084,26 @@
 		AA00000000000000000502 /* VoryCore */ = {
 			isa = XCSwiftPackageProductDependency;
 			productName = VoryCore;
+		};
+		AA00000000000000000701 /* A2UISwiftUI */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = AA00000000000000000700 /* XCRemoteSwiftPackageReference "a2ui-swift" */;
+			productName = A2UISwiftUI;
+		};
+		AA00000000000000000702 /* A2UISwiftUI */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = AA00000000000000000700 /* XCRemoteSwiftPackageReference "a2ui-swift" */;
+			productName = A2UISwiftUI;
+		};
+		AA00000000000000000703 /* A2UISwiftUI */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = AA00000000000000000700 /* XCRemoteSwiftPackageReference "a2ui-swift" */;
+			productName = A2UISwiftUI;
+		};
+		AA00000000000000000704 /* A2UISwiftUI */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = AA00000000000000000700 /* XCRemoteSwiftPackageReference "a2ui-swift" */;
+			productName = A2UISwiftUI;
 		};
 /* End XCSwiftPackageProductDependency section */
 	};

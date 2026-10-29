@@ -644,6 +644,15 @@ private final class StubChat: ChatIdentity {
         let bundled = PushSetupModel.bundledPluginVersion
         #expect(String(m) == bundled)
     }
+
+    /// The cards skill ships inside the plugin, and the copy the app uploads matches the repo.
+    @Test func bundledCardsSkillMatchesRepo() throws {
+        let bundle = Bundle(for: AppModel.self)
+        let url = try #require(bundle.url(forResource: "SKILL", withExtension: "md", subdirectory: "hermes-push/plugin/skills/vory-cards") ?? bundle.url(forResource: "SKILL", withExtension: "md"))
+        let bundled = try Data(contentsOf: url)
+        let source = try #require(repoFile("server/hermes-push/plugin/vory-push/skills/vory-cards/SKILL.md"))
+        #expect(bundled == source, "vory-cards/SKILL.md drifted — run Tools/sync-push-companion.sh")
+    }
 }
 
 

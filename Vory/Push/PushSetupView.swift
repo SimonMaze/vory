@@ -1355,13 +1355,9 @@ final class PushSetupModel {
         let target = Self.bundledPluginVersion
         guard let home = rt.profileHome else { updateOutcome = (false, "The gateway did not report its home folder."); return }
         let base = "\(home)/plugins/vory-push"
-        guard let script = Bundle.main.url(forResource: "hermes_push", withExtension: "py", subdirectory: "hermes-push") ?? Bundle.main.url(forResource: "hermes_push", withExtension: "py"),
-              let manifest = Bundle.main.url(forResource: "plugin", withExtension: "yaml", subdirectory: "hermes-push/plugin") ?? Bundle.main.url(forResource: "plugin", withExtension: "yaml"),
-              let entry = Bundle.main.url(forResource: "__init__", withExtension: "py", subdirectory: "hermes-push/plugin") ?? Bundle.main.url(forResource: "__init__", withExtension: "py"),
-              let s = try? Data(contentsOf: script), let m = try? Data(contentsOf: manifest), let e = try? Data(contentsOf: entry) else {
+        guard let files = Self.companionFiles() else {
             updateOutcome = (false, "The plugin files are missing from this build."); return
         }
-        let files = [("hermes_push.py", s, "text/x-python"), ("plugin.yaml", m, "text/yaml"), ("__init__.py", e, "text/x-python")]
         let total = Double(files.count + 3)   // files + enable + restart + heartbeat
         var done = 0.0
         updateStage = "Preparing Update…"
@@ -1663,6 +1659,23 @@ final class PushSetupModel {
     }
 
     static let heartbeatSeconds: TimeInterval = 10
+    /// The plugin files this build ships, paths relative to `<home>/plugins/vory-push/`.
+    /// The cards skill rides along so a bot learns the a2ui fence when the companion is installed.
+    static func companionFiles() -> [(String, Data, String)]? {
+        guard let script = Bundle.main.url(forResource: "hermes_push", withExtension: "py", subdirectory: "hermes-push") ?? Bundle.main.url(forResource: "hermes_push", withExtension: "py"),
+              let manifest = Bundle.main.url(forResource: "plugin", withExtension: "yaml", subdirectory: "hermes-push/plugin") ?? Bundle.main.url(forResource: "plugin", withExtension: "yaml"),
+              let entry = Bundle.main.url(forResource: "__init__", withExtension: "py", subdirectory: "hermes-push/plugin") ?? Bundle.main.url(forResource: "__init__", withExtension: "py"),
+              let skill = Bundle.main.url(forResource: "SKILL", withExtension: "md", subdirectory: "hermes-push/plugin/skills/vory-cards") ?? Bundle.main.url(forResource: "SKILL", withExtension: "md"),
+              let scriptData = try? Data(contentsOf: script), let manifestData = try? Data(contentsOf: manifest),
+              let entryData = try? Data(contentsOf: entry), let skillData = try? Data(contentsOf: skill) else { return nil }
+        return [
+            ("hermes_push.py", scriptData, "text/x-python"),
+            ("plugin.yaml", manifestData, "text/yaml"),
+            ("__init__.py", entryData, "text/x-python"),
+            ("skills/vory-cards/SKILL.md", skillData, "text/markdown"),
+        ]
+    }
+
     /// Version in the plugin manifest this build ships.
     static let bundledPluginVersion: String = {
         guard let url = Bundle.main.url(forResource: "plugin", withExtension: "yaml", subdirectory: "hermes-push/plugin") ?? Bundle.main.url(forResource: "plugin", withExtension: "yaml"),
@@ -1831,14 +1844,11 @@ final class PushSetupModel {
         installingPlugin = true; defer { installingPlugin = false }
         guard let home = rt.profileHome else { pluginResult = "The gateway did not report its home folder."; return }
         let base = "\(home)/plugins/vory-push"
-        guard let script = Bundle.main.url(forResource: "hermes_push", withExtension: "py", subdirectory: "hermes-push") ?? Bundle.main.url(forResource: "hermes_push", withExtension: "py"),
-              let manifest = Bundle.main.url(forResource: "plugin", withExtension: "yaml", subdirectory: "hermes-push/plugin") ?? Bundle.main.url(forResource: "plugin", withExtension: "yaml"),
-              let entry = Bundle.main.url(forResource: "__init__", withExtension: "py", subdirectory: "hermes-push/plugin") ?? Bundle.main.url(forResource: "__init__", withExtension: "py"),
-              let s = try? Data(contentsOf: script), let m = try? Data(contentsOf: manifest), let e = try? Data(contentsOf: entry) else {
+        guard let files = Self.companionFiles() else {
             pluginResult = "The plugin files are missing from this build."; return
         }
         do {
-            for (name, data, mime) in [("hermes_push.py", s, "text/x-python"), ("plugin.yaml", m, "text/yaml"), ("__init__.py", e, "text/x-python")] {
+            for (name, data, mime) in files {
                 let body: JSONValue = ["path": .string("\(base)/\(name)"), "data_url": .string("data:\(mime);base64," + data.base64EncodedString()), "overwrite": true]
                 let _: ManagedUploadResult = try await rt.api.send("POST", "/api/files/upload", json: body)
                 installedFiles.append(InstalledFile(name: name, directory: base + "/", bytes: data.count))

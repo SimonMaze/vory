@@ -46,6 +46,11 @@ public struct PendingCard: Identifiable, Hashable, Sendable {
     public var params: JSONValue
     /// True when the card came from `pending_approval` and must be answered with `approval.respond`.
     public var viaApprovalRPC = false
+    /// A prompt of Hermes's session authority (an `approval.request` or `clarify.request` event, or a snapshot's
+    /// `prompts`): its id and the turn's execution it belongs to, both of which its answer names (#665).
+    public var promptID: String?
+    public var generation: Int?
+    public var viaPrompt: Bool { promptID != nil }
 
     public init(id: String, method: String, params: JSONValue, viaApprovalRPC: Bool = false) {
         self.id = id; self.method = method; self.params = params; self.viaApprovalRPC = viaApprovalRPC
@@ -73,6 +78,25 @@ public struct PendingCard: Identifiable, Hashable, Sendable {
         if key == id { return true }
         guard let rid = requestID, !rid.isEmpty else { return false }
         return key == rid || key == "queue-" + rid
+    }
+}
+
+/// One try's race between its session.resume and its timeout (#641): the first to settle wins; a waiter that comes
+/// after gets it at once.
+@MainActor private final class TryRace {
+    private var outcome: Result<Void, Error>?
+    private var waiter: CheckedContinuation<Result<Void, Error>, Never>?
+
+    func settle(_ r: Result<Void, Error>) {
+        guard outcome == nil else { return }
+        outcome = r
+        waiter?.resume(returning: r)
+        waiter = nil
+    }
+
+    func wait() async -> Result<Void, Error> {
+        if let outcome { return outcome }
+        return await withCheckedContinuation { waiter = $0 }
     }
 }
 
@@ -147,6 +171,9 @@ public final class ChatSession: @MainActor Identifiable, ChatIdentity {
         didSet {
             guard isRunning != oldValue else { return }
             runtime.publishSnapshot()
+            // A turn that starts while a message waits in the composer to be edited (a reply from another device, say)
+            // ends the edit: the message is no longer the chat's last. The turn a resend starts leaves it to `resend`.
+            if isRunning, editingID != nil, !resending { editingID = nil }
             if isRunning {
                 activityEndTask?.cancel(); activityEndTask = nil
                 // A missed approval frame (a proxy that drops it, another client that answered
@@ -162,6 +189,8 @@ public final class ChatSession: @MainActor Identifiable, ChatIdentity {
                 }
             } else {
                 approvalPollTask?.cancel(); approvalPollTask = nil
+                // A Stop refused while the turn ran is out of date once it has ended, on its own too (#684).
+                clearStopRefusal()
                 // Every way a turn can stop (reclaim, a resume snapshot that says idle, a stray
                 // session.info) funnels through here, so the Live Activity cannot outlive the turn —
                 // but a moment later, so the brief idle blip between submit and the first token does
@@ -267,6 +296,9 @@ public final class ChatSession: @MainActor Identifiable, ChatIdentity {
     }
     public var queue: [QueuedMessage] = []
     public var staged: [AttachmentPreview] = []
+    /// Stagings under way (`stagingBegan`): a send waits for them (`stagingSettled`), so a file dropped, pasted or picked
+    /// just before Return goes with that message, not after it.
+    private var stagingInFlight = 0
     public var composerHistory: [String] = []
     public var lastSubmitStatus: String?
     public var stale = false
@@ -300,7 +332,30 @@ public final class ChatSession: @MainActor Identifiable, ChatIdentity {
     }
     private var resumeTask: Task<Void, Never>?
     private var bannerIsReconnect = false
+    /// The words a refused Stop put in the banner, until a Stop is taken (#684).
+    private var stopRefusalShown: String?
     private var lastActivityUpdate = Date.distantPast
+
+    // The re-attach after a lost live attach (#641).
+    /// What the dock shows of it: nothing, the quiet "Reconnecting…" line, or the banner with Try again.
+    public private(set) var reattachShow: ReattachShow = .none
+    /// When this chat lost its live attach, in this stretch in front; nil while attached.
+    @ObservationIgnored private var troubleSince: Date?
+    /// Failed tries in a row since the trouble began: the schedule's n, and the next try's timeout.
+    @ObservationIgnored private var reattachFailures = 0
+    /// Bumped by every trigger and by an attach: what a try or a timer of an older one comes to is dropped, so a
+    /// superseded try says nothing by construction, whatever it throws.
+    @ObservationIgnored private var reattachGeneration = 0
+    /// The tries' schedule, and the clock that moves the line to the banner.
+    @ObservationIgnored private var reattachTimer: Task<Void, Never>?
+    @ObservationIgnored private var showTimer: Task<Void, Never>?
+    /// The socket went: no try of the chat's own until it's back, or Try again.
+    @ObservationIgnored private var waitingForSocket = false
+    /// How many of this chat's views are up (an iPad split or two Mac windows on one chat both hold it). A chat on
+    /// screen gets the schedule and the line; one off screen re-attaches once per trigger, through the runtime.
+    @ObservationIgnored private var screens = 0
+    /// The re-attach's clock; a test's manual one.
+    @ObservationIgnored var reattachClock = ReattachClock.live
     public var id: String { storedID }
 
     private var assembler = StreamAssembler()
@@ -309,6 +364,7 @@ public final class ChatSession: @MainActor Identifiable, ChatIdentity {
     /// streaming row and re-lay out the thread. They are gathered and shown about 25 times a
     /// second instead, which reads the same and leaves the main thread free to scroll.
     private var streamFlush: Task<Void, Never>?
+    var isStreamFlushScheduled: Bool { streamFlush != nil }
     private var lastStatsUpdate = Date.distantPast
     /// Assistant text already sealed into earlier bubbles of the current turn, because tool calls
     /// split the stream. `message.complete` carries the WHOLE turn, so it must be reconciled
@@ -487,11 +543,14 @@ public final class ChatSession: @MainActor Identifiable, ChatIdentity {
     // MARK: Lifecycle
 
     public func create(cwd: String? = nil) async throws {
-        var params: [String: JSONValue] = ["cols": 80]
+        // No "cols": Hermes's canonical create (v0.23.0's session authority) refuses a key it doesn't declare, and the
+        // legacy create takes the 80 it would have said by default (#665). session.resume still sends it.
+        var params: [String: JSONValue] = [:]
         if let cwd, !cwd.isEmpty { params["cwd"] = .string(cwd); params["cwd_explicit"] = .bool(true) }
         let r = try await rpc("session.create", params)
         runtimeID = r["session_id"]?.stringValue ?? ""
         storedID = r["stored_session_id"]?.stringValue ?? runtimeID
+        noteAttach(r)
         info = try? r["info"]?.decode(SessionLiveInfo.self)
         title = info?.title?.isEmpty == false ? info!.title! : "New chat"
         items = []
@@ -515,36 +574,183 @@ public final class ChatSession: @MainActor Identifiable, ChatIdentity {
         await apply(snapshot: r, listedAt: asked)
     }
 
-    public func reattachAfterReconnect(retrying: Bool = true) async {
-        do {
-            try await resumeFromGateway()
-            stale = false
-            if bannerIsReconnect { banner = nil; bannerIsReconnect = false }
-        } catch is CancellationError {
-            // A newer reconnect superseded this one; it will re-attach the chat itself.
+    // MARK: Re-attach (#641)
+
+    /// The banner's words, from a minute of trouble; the error's own text goes to the log only.
+    public nonisolated static let reattachFailedLine = "This chat isn't connected. Vory keeps trying."
+    /// Said to VoiceOver when a chat whose banner had come is attached again.
+    public nonisolated static let reattachBackLine = "This chat is connected again."
+
+    public var isOnScreen: Bool { screens > 0 }
+    /// In trouble, and not a chat the gateway no longer has: the runtime's triggers try it.
+    var needsReattach: Bool { troubleSince != nil && !attachGone }
+    private var socketOpen: Bool { gatewayStandIn != nil || runtime.socketState.isOpen }
+
+    /// A view of this chat came up. One that comes up while the chat isn't attached gets a try at once, and the
+    /// schedule from then.
+    public func cameOnScreen() {
+        screens += 1
+        if screens == 1, needsReattach { reattachNow() }
+    }
+
+    /// A view of this chat went. Off screen, no more scheduled tries: the runtime's triggers try it once each.
+    public func wentOffScreen() {
+        screens = max(0, screens - 1)
+        if screens == 0 { reattachTimer?.cancel() }
+    }
+
+    /// The socket left .open: a chat attached until now has lost its live attach, and waits for the socket. A chat whose
+    /// open failed, or is still opening, keeps its own path (`retryFailedAttach`).
+    func socketWent() {
+        guard !attachGone, resumeError == nil, !isResuming else { return }
+        waitingForSocket = true
+        if troubleSince == nil { troubleSince = reattachClock.now(); updateShow() }
+    }
+
+    /// Try again (the banner's button): the socket's wait between attempts cut short, and a try now.
+    public func tryAgain() {
+        let socket = runtime.socket
+        Task { await socket?.retryNow() }
+        reattachNow()
+    }
+
+    /// The app went away: the tries and the clock stop.
+    func wentAwayForReattach() {
+        reattachGeneration += 1
+        reattachTimer?.cancel(); reattachTimer = nil
+        showTimer?.cancel(); showTimer = nil
+    }
+
+    /// The app came back: a chat still in trouble counts from now (a fresh minute of the quiet line before any banner),
+    /// and its tries start over. The runtime then tries it at once.
+    func cameBackForReattach() {
+        guard needsReattach else { return }
+        troubleSince = reattachClock.now()
+        reattachFailures = 0
+        updateShow()
+    }
+
+    /// A trigger for a chat on screen: a try now, then the schedule while it fails and the chat stays on screen. While the
+    /// socket isn't open, the chat waits for it instead.
+    func reattachNow() {
+        guard !attachGone else { return }
+        if troubleSince == nil { troubleSince = reattachClock.now() }
+        reattachGeneration += 1
+        let g = reattachGeneration
+        reattachTimer?.cancel()
+        updateShow()
+        guard socketOpen else { waitingForSocket = true; return }
+        reattachTimer = Task { [weak self] in await self?.runTries(generation: g) }
+    }
+
+    /// One try, waited on: after a reconnect for a chat off screen (the runtime runs them one at a time), and the Live
+    /// Activity's re-read. A chat on screen goes on with the schedule if it fails.
+    public func reattachAfterReconnect() async {
+        guard !attachGone else { return }
+        if troubleSince == nil { troubleSince = reattachClock.now() }
+        reattachGeneration += 1
+        let g = reattachGeneration
+        reattachTimer?.cancel()
+        updateShow()
+        guard await oneTry(generation: g) == .failed, isOnScreen, g == reattachGeneration else { return }
+        reattachTimer = Task { [weak self] in
+            guard let self else { return }
+            guard await self.waitOut(generation: g) else { return }
+            await self.runTries(generation: g)
+        }
+    }
+
+    private func runTries(generation g: Int) async {
+        while !Task.isCancelled, g == reattachGeneration {
+            guard await oneTry(generation: g) == .failed, isOnScreen, await waitOut(generation: g) else { return }
+        }
+    }
+
+    /// The schedule's wait after the failures so far, spread by its jitter; false when superseded meanwhile.
+    private func waitOut(generation g: Int) async -> Bool {
+        let d = ReattachSchedule.delay(afterFailures: reattachFailures)
+            * Double.random(in: (1 - ReattachSchedule.jitter)...(1 + ReattachSchedule.jitter))
+        do { try await reattachClock.sleep(d) } catch { return false }
+        return !Task.isCancelled && g == reattachGeneration
+    }
+
+    private enum TryOutcome { case attached, gone, waitingForSocket, failed, superseded }
+
+    /// One session.resume, given up on after the try's timeout (30 s, then 60, then 120). The resume runs in a task of its
+    /// own, so the timeout can end the wait without waiting on it, and the caller's cancellation reaches it.
+    private func oneTry(generation g: Int) async -> TryOutcome {
+        let timeout = ReattachSchedule.tryTimeout(try: reattachFailures + 1)
+        let clock = reattachClock
+        let race = TryRace()
+        let work = Task { [weak self] in
+            guard let self else { race.settle(.failure(CancellationError())); return }
+            do { try await self.resumeFromGateway(); race.settle(.success(())) } catch { race.settle(.failure(error)) }
+        }
+        let timer = Task {
+            do { try await clock.sleep(timeout) } catch { return }
+            race.settle(.failure(SocketError.timeout("session.resume")))
+            work.cancel()
+        }
+        let result = await withTaskCancellationHandler { await race.wait() } onCancel: { work.cancel(); timer.cancel() }
+        timer.cancel()
+        // A try a newer trigger or reconnect superseded, or a cancelled one: whatever it threw is dropped, so it says
+        // nothing (a cancelled ready wait throws the socket's timeout, "gateway.ready (cancelled)", not a cancellation).
+        guard !Task.isCancelled, g == reattachGeneration else { return .superseded }
+        switch result {
+        case .success:
+            reattached()
+            return .attached
+        case .failure(let error):
+            if error is CancellationError { return .superseded }
             stale = true
-        } catch SocketError.notConnected {
-            // The socket went between the reconnect and this call (a network still settling
-            // after the app came back, a socket found dead on return): the reconnect that
-            // follows re-attaches the chat itself, so no banner for a failure the next try
-            // undoes (a tester's "Reconnected, but the chat could not be re-attached: Not
-            // connected to the gateway" after coming back).
-            stale = true
-        } catch SocketError.timeout where retrying {
-            // The gateway was slow to answer once; once more before saying so.
-            try? await Task.sleep(for: .seconds(2))
-            await reattachAfterReconnect(retrying: false)
-        } catch {
-            stale = true
-            if !(error is CancellationError), !error.localizedDescription.contains("CancellationError") {
-                let why = error.localizedDescription
-                if Self.isGone(why) {
-                    banner = Self.goneBanner
-                } else {
-                    banner = "Reconnected, but the chat could not be re-attached: \(why)"
-                }
+            if case SocketError.notConnected = error { waitingForSocket = true; return .waitingForSocket }
+            // The chat waited on the socket's ready itself (the Live Activity's re-read) and the socket didn't come: it
+            // waits for the socket, never a banner on its own.
+            if case SocketError.timeout(let what) = error, what.hasPrefix("gateway.ready") { waitingForSocket = true; return .waitingForSocket }
+            let why = error.localizedDescription
+            if Self.isGone(why) {
+                attachGone = true
+                troubleSince = nil
+                showTimer?.cancel(); showTimer = nil
+                reattachShow = .none
+                banner = Self.goneBanner
                 bannerIsReconnect = true
+                return .gone
             }
+            reattachFailures += 1
+            log.info("re-attach try \(self.reattachFailures) failed: \(why, privacy: .public)")
+            return .failed
+        }
+    }
+
+    /// Attached again: the trouble over, and the line, the banner and a reconnect's own banner gone.
+    private func reattached() {
+        stale = false
+        troubleSince = nil
+        reattachFailures = 0
+        waitingForSocket = false
+        reattachGeneration += 1
+        showTimer?.cancel(); showTimer = nil
+        reattachShow = .none
+        if bannerIsReconnect { banner = nil; bannerIsReconnect = false }
+    }
+
+    /// What shows now, from how long the trouble has lasted, and a timer to the next change (the line at 2 s, the
+    /// banner at 60 s).
+    private func updateShow() {
+        showTimer?.cancel(); showTimer = nil
+        guard let since = troubleSince, !attachGone else { reattachShow = .none; return }
+        let elapsed = reattachClock.now().timeIntervalSince(since)
+        let now = ReattachSchedule.show(after: elapsed)
+        if reattachShow != now { reattachShow = now }
+        let next = elapsed < ReattachSchedule.lineAfter ? ReattachSchedule.lineAfter
+            : elapsed < ReattachSchedule.bannerAfter ? ReattachSchedule.bannerAfter : nil
+        guard let next else { return }
+        let clock = reattachClock
+        showTimer = Task { [weak self] in
+            do { try await clock.sleep(next - elapsed) } catch { return }
+            guard let self, !Task.isCancelled, self.troubleSince == since else { return }
+            self.updateShow()
         }
     }
 
@@ -571,11 +777,11 @@ public final class ChatSession: @MainActor Identifiable, ChatIdentity {
     /// Shows the last transcript this device saw for the session while `resume()` runs, or a REST
     /// page of it when nothing is cached; `resume()` then replaces both with the live snapshot.
     public func beginResume() {
-        if items.isEmpty, let cached = TranscriptCache.load(connection: runtime.connection.id, storedID: storedID), !cached.isEmpty {
+        if items.isEmpty, !runtime.isEphemeral, let cached = TranscriptCache.load(connection: runtime.connection.id, storedID: storedID), !cached.isEmpty {
             items = TranscriptItem.fromHistory(cached)
             fetchedRowIDs = Set(items.map(\.id))
         }
-        if info == nil, cachedModel == nil {
+        if info == nil, cachedModel == nil, !runtime.isEphemeral {
             cachedModel = TranscriptCache.loadInfo(connection: runtime.connection.id, storedID: storedID)?.model
             // No cache and no bots yet (a first launch whose profile load failed and was not
             // asked again): the bot's default model needs the list.
@@ -616,6 +822,8 @@ public final class ChatSession: @MainActor Identifiable, ChatIdentity {
     }
 
     private func saveTranscriptCache() {
+        // The demo's chats are never written to this device's cache.
+        guard !runtime.isEphemeral else { return }
         TranscriptCache.save(items, connection: runtime.connection.id, storedID: storedID)
         if let info { TranscriptCache.saveInfo(info, connection: runtime.connection.id, storedID: storedID) }
     }
@@ -724,6 +932,8 @@ public final class ChatSession: @MainActor Identifiable, ChatIdentity {
         // one the gateway gave a new id, and a reply that finished then never ended here.
         if let rid = r["session_id"]?.stringValue, !rid.isEmpty { runtimeID = rid }
         if let sid = r["stored_session_id"]?.stringValue, !sid.isEmpty { storedID = sid }
+        // On Hermes's session authority, its execution, revision and this socket's subscription (#666).
+        noteAttach(r)
         snapshotsAnswered += 1
         let order = snapshotsAnswered
         // Events held so far came before this reply: the snapshot shows them already.
@@ -841,7 +1051,7 @@ public final class ChatSession: @MainActor Identifiable, ChatIdentity {
         // No reply streams in this snapshot: the one this device was drawing is history's row
         // now. Its id kept, the next turn's text went into a row no longer there, and its end
         // added the answer a second time.
-        if let id = streamingItemID, !items.contains(where: { $0.id == id }) { streamingItemID = nil; assembler.reset() }
+        if let id = streamingItemID, !items.contains(where: { $0.id == id }) { streamFlush?.cancel(); streamFlush = nil; streamingItemID = nil; assembler.reset() }
         fetchedRowIDs = Set(items.map(\.id))
         items += added
         if let q = r["queued"]?["user"]?.stringValue, !q.isEmpty { queue = [QueuedMessage(text: q)] }
@@ -878,6 +1088,15 @@ public final class ChatSession: @MainActor Identifiable, ChatIdentity {
             var params = pa.objectValue ?? [:]
             params["session_id"] = .string(runtimeID)
             listed.append(PendingCard(id: "queue-\(rid)", method: "approval", params: .object(params), viaApprovalRPC: true))
+        }
+        // Hermes's session authority lists its open prompts (approvals, questions) with the turn's execution (#665).
+        if runtime.sessionAuthority {
+            noteGeneration(r["execution_generation"]?.intValue)
+            for prompt in r["prompts"]?.arrayValue ?? [] {
+                guard let card = Self.promptCard(prompt, sessionID: runtimeID), !listed.contains(where: { $0.id == card.id }),
+                      !removedHere(card.id, since: listedAt) else { continue }
+                listed.append(card)
+            }
         }
         // One question, under its own id or the approval queue's.
         func same(_ a: PendingCard, _ b: PendingCard) -> Bool {
@@ -936,6 +1155,8 @@ public final class ChatSession: @MainActor Identifiable, ChatIdentity {
     /// The fallback the gateway offers for a missed approval frame: anything still waiting on
     /// this session becomes a card answered through `approval.respond`.
     public func pollPendingApprovals() async {
+        // The session authority's prompts come and go by event, and its list carries no execution to answer with.
+        guard !runtime.sessionAuthority else { return }
         let asked = Date()
         lastApprovalCheck = asked
         let asking = askingForList(at: asked)
@@ -972,6 +1193,12 @@ public final class ChatSession: @MainActor Identifiable, ChatIdentity {
     }
 
     public func loadUsage() async {
+        if runtime.sessionAuthority {
+            // Hermes's session authority doesn't serve session.usage: the counters come from session.stats, shown as its
+            // own status bar shows them (#666). The live session.usage tick is the same on both wires.
+            if let stats = try? await rpc("session.stats", ["session_id": .string(runtimeID)]) { usage = Usage(stats: stats) }
+            return
+        }
         if let u: Usage = try? (await rpc("session.usage", ["session_id": .string(runtimeID)])).decode() { usage = u }
     }
 
@@ -987,6 +1214,9 @@ public final class ChatSession: @MainActor Identifiable, ChatIdentity {
     /// then answers in short plain sentences, with the recent spoken exchange in mind.
     public func send(_ rawText: String, voice: VoiceTurn? = nil) async -> String? {
         let text = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
+        // A file still staging is part of this message: waited for before anything is decided, so a message of only
+        // that file is not taken for an empty one.
+        await stagingSettled()
         guard !text.isEmpty || !staged.isEmpty else { return nil }
         await awaitResume()
         if let e = resumeError { return "This chat could not be opened on the gateway: \(e)" }
@@ -1000,7 +1230,159 @@ public final class ChatSession: @MainActor Identifiable, ChatIdentity {
         return nil
     }
 
-    private func submit(text: String, queued: Bool, voice: VoiceTurn? = nil) async {
+    // MARK: Edit & resend (#556)
+
+    /// The message the composer holds to be edited (Edit & resend): its item id, nil when none. Only the chat's last
+    /// message of the person's own can be (`lastResendableID`), since the gateway takes a chat back from its last user
+    /// turn. It ends on Cancel, on a resend that went, on leaving the chat, and when a turn starts meanwhile (a reply from
+    /// another device): not for the turn its own resend starts (`resending`).
+    public private(set) var editingID: String?
+    /// While `resend` runs: the turn it starts leaves the edit alone; `resend` ends it itself.
+    public private(set) var resending = false
+
+    /// The chat's last message of the person's own, when it can be edited and sent again: plain words, no attachments (a
+    /// resend sends words only). A notice the gateway put in the person's seat (a background process reporting, another
+    /// bot's message) standing last means none, since the gateway would take back from its own last user turn instead.
+    public var lastResendableID: String? {
+        guard let last = items.last(where: { if case .user = $0.kind { return true }; return false }),
+              case .user(let text, let attachments) = last.kind, attachments.isEmpty,
+              InjectedNote.parse(text) == nil, AgentMessage.parse(text) == nil else { return nil }
+        return last.id
+    }
+
+    /// Starts editing `id` in the composer, if it's the chat's last message of the person's own and no reply runs.
+    @discardableResult public func beginEdit(_ id: String) -> Bool {
+        guard !isRunning, !runtime.undoUnsupported, id == lastResendableID else { return false }
+        editingID = id
+        return true
+    }
+
+    /// Ends the edit (Cancel, leaving the chat). Not while a resend is on its way: that ends it itself.
+    public func cancelEdit() {
+        guard !resending else { return }
+        editingID = nil
+    }
+
+    /// How a resend ended. Only `sent` sent anything; every other case leaves the edited words to the composer.
+    public enum ResendOutcome: Equatable, Sendable {
+        case sent
+        /// A reply was running, here or on the gateway (4009).
+        case busy
+        /// The message isn't the chat's last of the person's own any more.
+        case notLast
+        /// The gateway had nothing to take back (`removed` 0).
+        case nothingRemoved
+        /// The gateway doesn't know `session.undo`: Copy to message from now on.
+        case unsupported
+        /// The old message was taken back, but the chat couldn't be read again: the words stay to send as a new message.
+        case reloadFailed(String)
+        /// The old message was taken back and the chat read again, but the new words didn't go: they stay, to send as a new
+        /// message.
+        case sendFailed
+        /// Anything else, in the gateway's words.
+        case failed(String)
+
+        /// What the person is told, or nil for a resend that went.
+        public var message: String? {
+            switch self {
+            case .sent: return nil
+            case .busy: return "A reply is running. Stop it, then send your edited message."
+            case .notLast: return "Only your last message can be edited and sent again. Your words are still in the box."
+            case .nothingRemoved: return "The gateway had no message to take back, so nothing was sent. Your words are still in the box."
+            case .unsupported: return "This gateway can't take back a sent message. Your words are still in the box: send them as a new message."
+            case .reloadFailed(let why): return "Your message was taken back, but the chat couldn't be read again (\(why)). Your words are still in the box: send them as a new message."
+            case .sendFailed: return "Your message was taken back, but the new one didn't go. Your words are still in the box: send them as a new message."
+            case .failed(let why): return "Your message couldn't be edited (\(why)). Nothing was sent; your words are still in the box."
+            }
+        }
+    }
+
+    /// Sends `rawText` in place of the message being edited (`editingID`): the gateway takes that turn and everything after
+    /// it back (`session.undo`, said as a retry), the chat is read again so the old turn leaves as one change, then the
+    /// words go as a new turn. Anything that stops it before the gateway took the turn back keeps the edit; once it did,
+    /// the edit ends whatever follows, so a second Send never takes back the turn before it.
+    public func resend(_ rawText: String) async -> ResendOutcome {
+        let text = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let id = editingID, !text.isEmpty else { return .failed("nothing to send") }
+        await awaitResume()
+        if let e = resumeError { return .failed(e) }
+        guard !isRunning else { return .busy }
+        guard id == lastResendableID else { return .notLast }
+        resending = true
+        defer { resending = false }
+        if runtime.sessionAuthority {
+            if let stopped = await rewindForResend(id) { return stopped }
+        } else {
+            do {
+                let r = try await rpc("session.undo", ["session_id": .string(runtimeID), "intent": "retry"])
+                guard (r["removed"]?.intValue ?? 0) > 0 else { return .nothingRemoved }
+            } catch let e as RPCError where e.code == RPCError.methodNotFound {
+                runtime.undoUnsupported = true
+                editingID = nil
+                return .unsupported
+            } catch let e as RPCError where e.code == 4009 {
+                return .busy
+            } catch {
+                return .failed(error.localizedDescription)
+            }
+        }
+        editingID = nil
+        do { try await resumeFromGateway() } catch { return .reloadFailed(error.localizedDescription) }
+        composerHistory.append(text)
+        return await submit(text: text, queued: false) ? .sent : .sendFailed
+    }
+
+    /// Edit & resend's take-back on Hermes's session authority, which has no session.undo: a rewind to the edited
+    /// message's row, which takes it and everything after it back (session.mutate, #666). A message sent from here has no
+    /// row until the chat is read again, so it's read first; a chat that moved on meanwhile (its last message of the
+    /// person's own isn't these words any more) is "not last". Nil once the gateway took the turn back, otherwise how
+    /// the resend ends.
+    private func rewindForResend(_ id: String) async -> ResendOutcome? {
+        guard case .user(let words, _)? = items.first(where: { $0.id == id })?.kind else { return .notLast }
+        var known = items.first(where: { $0.id == id })?.rowID
+        if known == nil {
+            do { try await resumeFromGateway() } catch { return .failed(error.localizedDescription) }
+            guard let last = lastOwnMessage(), Self.says(last, words) else { return .notLast }
+            known = last.rowID
+        }
+        guard let row = known else { return .nothingRemoved }
+        do {
+            let r = try await mutate("rewind", ["target_message_id": .number(Double(row))], needsGeneration: true) { [unowned self] in
+                // A fence moved: the chat is read again, and the rewind goes once more only if the message is still the last.
+                try await self.resumeFromGateway()
+                guard let last = self.lastOwnMessage(), Self.says(last, words), last.rowID == row else { throw ResendStop.notLast }
+            }
+            return (r["rewound_count"]?.intValue ?? 0) > 0 ? nil : .nothingRemoved
+        } catch ResendStop.notLast {
+            return .notLast
+        } catch let e as RPCError where e.code == RPCError.methodNotFound {
+            runtime.undoUnsupported = true
+            editingID = nil
+            return .unsupported
+        } catch let e as RPCError where e.message == "session_busy" {
+            return .busy
+        } catch let e as RPCError where e.message == "invalid_params" && e.data?["field"]?.stringValue == "target_message_id" {
+            return .nothingRemoved
+        } catch {
+            return .failed(error.localizedDescription)
+        }
+    }
+
+    private enum ResendStop: Error { case notLast }
+
+    /// The chat's last message of the person's own that could be edited (`lastResendableID`'s item).
+    private func lastOwnMessage() -> TranscriptItem? { lastResendableID.flatMap { last in items.first { $0.id == last } } }
+
+    private nonisolated static func says(_ item: TranscriptItem, _ words: String) -> Bool {
+        if case .user(let t, _) = item.kind { return t == words }
+        return false
+    }
+
+    /// A turn's input id: a fresh uuid as lowercase hex, 32 characters (#682).
+    nonisolated static func newInputID() -> String { UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased() }
+
+    @discardableResult private func submit(text: String, queued: Bool, voice: VoiceTurn? = nil) async -> Bool {
+        await stagingSettled()
         interruptCause = nil
         var outgoing = text
         var previews: [AttachmentPreview] = []
@@ -1021,16 +1403,26 @@ public final class ChatSession: @MainActor Identifiable, ChatIdentity {
             var params: [String: JSONValue] = ["session_id": .string(runtimeID), "text": .string(outgoing)]
             if queued { params["queued"] = true }
             voice?.apply(to: &params)
+            // On Hermes's session authority each turn names itself (#682): it admits a prompt.submit only with a non-empty
+            // submission_id or input_id (gateway/session_controls.py submission()). The id is made once per turn, here: a
+            // new message, a queued one sent, a spoken turn and Edit & resend each get their own. The legacy handler
+            // refuses a key its contract doesn't declare, and declares neither, so that wire's submit stays as it was.
+            if runtime.sessionAuthority { params["input_id"] = .string(Self.newInputID()) }
             let r = try await rpc("prompt.submit", params)
             lastSubmitStatus = r["status"]?.stringValue
-            if lastSubmitStatus == "queued" { statusLine = "Queued on the gateway" }
+            // A legacy gateway answers "queued" when the message waits behind a running turn. Hermes's session authority
+            // admits every message to its own queue and answers "queued" even when the turn starts at once (#682), so
+            // there the turn's own events set the line.
+            if lastSubmitStatus == "queued" && !runtime.sessionAuthority { statusLine = "Queued on the gateway" }
             activity.start(for: self)
             runtime.pushRegistrar?.noteSend(session: storedID, runtime: runtime)
+            return true
         } catch {
             startedHere = false
             isRunning = false
             statusLine = nil
             items.append(TranscriptItem(id: UUID().uuidString, kind: .error(text: error.localizedDescription)))
+            return false
         }
     }
 
@@ -1057,18 +1449,37 @@ public final class ChatSession: @MainActor Identifiable, ChatIdentity {
     }
 
     private func upload(_ a: AttachmentPreview) async throws -> String? {
-        guard let url = a.localURL, let data = try? Data(contentsOf: url) else { return nil }
-        let b64 = data.base64EncodedString()
-        switch a.kind {
-        case .image:
-            _ = try await rpc("image.attach_bytes", ["session_id": .string(runtimeID), "content_base64": .string(b64), "filename": .string(a.name)])
+        guard let url = a.localURL else { throw CocoaError(.fileNoSuchFile) }
+        let kind = a.kind
+        let name = a.name
+        let runtimeID = self.runtimeID
+
+        enum UploadPayload: Sendable {
+            case imageOrPdf(b64: String, filename: String, isImage: Bool)
+            case file(dataUrl: String, filename: String)
+        }
+
+        let payload = try await Task.detached(priority: .userInitiated, operation: { () -> UploadPayload in
+            let data = try Data(contentsOf: url)
+            let b64 = data.base64EncodedString()
+            switch kind {
+            case .image:
+                return .imageOrPdf(b64: b64, filename: name, isImage: true)
+            case .pdf:
+                return .imageOrPdf(b64: b64, filename: name, isImage: false)
+            case .audio, .video, .file:
+                let mime = UTType(filenameExtension: url.pathExtension)?.preferredMIMEType ?? "application/octet-stream"
+                return .file(dataUrl: "data:\(mime);base64,\(b64)", filename: name)
+            }
+        }).value
+
+        switch payload {
+        case .imageOrPdf(let b64, let filename, let isImage):
+            let method = isImage ? "image.attach_bytes" : "pdf.attach"
+            _ = try await rpc(method, ["session_id": .string(runtimeID), "content_base64": .string(b64), "filename": .string(filename)])
             return nil
-        case .pdf:
-            _ = try await rpc("pdf.attach", ["session_id": .string(runtimeID), "content_base64": .string(b64), "filename": .string(a.name)])
-            return nil
-        case .audio, .video, .file:
-            let mime = UTType(filenameExtension: url.pathExtension)?.preferredMIMEType ?? "application/octet-stream"
-            let r = try await rpc("file.attach", ["session_id": .string(runtimeID), "data_url": .string("data:\(mime);base64,\(b64)"), "name": .string(a.name)])
+        case .file(let dataUrl, let filename):
+            let r = try await rpc("file.attach", ["session_id": .string(runtimeID), "data_url": .string(dataUrl), "name": .string(filename)])
             return r["ref_text"]?.stringValue
         }
     }
@@ -1078,9 +1489,19 @@ public final class ChatSession: @MainActor Identifiable, ChatIdentity {
     nonisolated(unsafe) public static var imageTranscoder: (@Sendable (Data, String) -> (Data, String)?)?
 
     public func stageAttachment(data: Data, name: String, kind: AttachmentPreview.Kind) {
+        if data.count > 512 * 1024 {
+            // Counted now, not when the task gets to run: a send right after this waits for it.
+            stagingBegan()
+            Task { [weak self] in
+                await self?.stageOffMain(data: data, name: name, kind: kind)
+                self?.stagingEnded()
+            }
+            return
+        }
+
         var data = data, name = name
         if kind == .image, let t = Self.imageTranscoder?(data, name) { data = t.0; name = t.1 }
-        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("staged-\(runtimeID)", isDirectory: true)
+        let dir = runtime.scratchDirectory.appendingPathComponent("staged-\(runtimeID)", isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let url = dir.appendingPathComponent(UUID().uuidString + "-" + name)
         do {
@@ -1091,24 +1512,171 @@ public final class ChatSession: @MainActor Identifiable, ChatIdentity {
         }
     }
 
+    /// Asynchronous staging for large payloads off @MainActor. A send made meanwhile waits for it.
+    public func stageAttachmentAsync(data: Data, name: String, kind: AttachmentPreview.Kind) async {
+        stagingBegan()
+        await stageOffMain(data: data, name: name, kind: kind)
+        stagingEnded()
+    }
+
+    /// A staging that starts before its bytes are in hand (a drop, a file being read, photos loading): counted from
+    /// now, so a send made meanwhile waits for it. Each `stagingBegan` is matched by one `stagingEnded`, when the
+    /// file is staged or given up.
+    public func stagingBegan() { stagingInFlight += 1 }
+
+    public func stagingEnded() { stagingInFlight = max(0, stagingInFlight - 1) }
+
+    /// Returns once no staging is under way, or after `seconds` at most: a staging that never ends (a drop whose
+    /// provider never answers) holds one message up for that long, never every message after it, since what is still
+    /// counted then is given up (an end that comes later finds nothing to take away).
+    func stagingSettled(upTo seconds: Double = 60) async {
+        let deadline = Date().addingTimeInterval(seconds)
+        while stagingInFlight > 0, Date() < deadline { try? await Task.sleep(for: .milliseconds(50)) }
+        stagingInFlight = 0
+    }
+
+    private func stageOffMain(data: Data, name: String, kind: AttachmentPreview.Kind) async {
+        let dir = runtime.scratchDirectory.appendingPathComponent("staged-\(runtimeID)", isDirectory: true)
+        let transcoder = Self.imageTranscoder
+        let result: Result<AttachmentPreview, Error> = await Task.detached(priority: .userInitiated) {
+            var data = data, name = name
+            if kind == .image, let t = transcoder?(data, name) { data = t.0; name = t.1 }
+            do {
+                try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+                let url = dir.appendingPathComponent(UUID().uuidString + "-" + name)
+                try data.write(to: url)
+                return .success(AttachmentPreview(id: url.lastPathComponent, name: name, serverPath: nil, kind: kind, localURL: url, byteCount: data.count))
+            } catch {
+                return .failure(error)
+            }
+        }.value
+        switch result {
+        case .success(let preview):
+            staged.append(preview)
+        case .failure(let error):
+            banner = "Could not stage \(name): \(error.localizedDescription)"
+        }
+    }
+
     public func removeStaged(_ id: String) {
         if let a = staged.first(where: { $0.id == id }), let u = a.localURL { try? FileManager.default.removeItem(at: u) }
         staged.removeAll { $0.id == id }
     }
 
-    public func stop() async {
+    /// Stop: the running turn interrupted. On Hermes's session authority a Stop names the turn by its execution, as a
+    /// steer does: without it, or with an older one, the gateway refuses it (`stale_generation`) and the turn runs on
+    /// (#683). A Stop the gateway doesn't take is said in the banner, on either wire, not dropped, and its words are given
+    /// back, for a Stop made elsewhere (the Watch's, through this iPhone) to be answered with them (#684); nil for a Stop
+    /// taken or one whose call was cancelled. A Stop taken, or the turn's end, clears an earlier Stop's refusal from the
+    /// banner, and only that.
+    @discardableResult
+    public func stop() async -> String? {
+        streamFlush?.cancel(); streamFlush = nil
         interruptCause = .stopped
-        _ = try? await rpc("session.interrupt", ["session_id": .string(runtimeID)])
+        var params: [String: JSONValue] = ["session_id": .string(runtimeID)]
+        if runtime.sessionAuthority, let generation = executionGeneration { params["execution_generation"] = .number(Double(generation)) }
+        do {
+            _ = try await rpc("session.interrupt", params)
+        } catch {
+            // A Stop whose call was cancelled may have reached the gateway: nothing is said, and the cause stays.
+            guard !(error is CancellationError) else { return nil }
+            interruptCause = nil
+            let words = stopRefusal(error)
+            banner = words
+            stopRefusalShown = words
+            return words
+        }
+        // "Couldn't be stopped" stayed on screen after a later Stop had stopped the reply (#684).
+        clearStopRefusal()
+        return nil
     }
 
-    public func steer(_ text: String) async {
+    /// A refused Stop's words gone from the banner, once a Stop is taken or the turn has ended (#684). Only those: another
+    /// banner put up since has other words, and stays.
+    private func clearStopRefusal() {
+        if let shown = stopRefusalShown, banner == shown { banner = nil }
+        stopRefusalShown = nil
+    }
+
+    /// What a refused Stop says, in plain words (#683). The authority's stale_generation means the reply moved on (a newer
+    /// execution) between what the chat knew and the tap: pressing Stop again names the newer one. A reason in words is
+    /// quoted; a bare code (permission_denied, not_found) isn't, and goes to the log.
+    private func stopRefusal(_ error: Error) -> String {
+        let reason = (error as? RPCError)?.message ?? error.localizedDescription
+        if reason == "stale_generation" { return "The reply couldn't be stopped. Try Stop again." }
+        if reason.range(of: "^[a-z0-9_]*$", options: .regularExpression) != nil {
+            log.notice("session.interrupt refused: \(reason, privacy: .public)")
+            return "The reply couldn't be stopped."
+        }
+        return "The reply couldn't be stopped: \(reason)"
+    }
+
+    /// The composer's Steer now: `text` into the running turn. Gives back the words for the composer to put back, as a
+    /// failed send does: the text itself when the steer failed (said in the banner), and when no turn took it (the
+    /// gateway's "rejected": the turn had ended) whatever sending it as the next message gives back.
+    @discardableResult
+    public func steer(_ text: String) async -> String? {
         do {
-            let r = try await rpc("session.steer", ["session_id": .string(runtimeID), "text": .string(text)])
-            items.append(TranscriptItem(id: UUID().uuidString, kind: .steer(text: text, status: r["status"]?.stringValue ?? "queued")))
+            guard try await steerSending(text) == "rejected" else { return nil }
+            return await send(text)
+        } catch let e as RPCError where runtime.sessionAuthority && e.message == "stale_generation" {
+            // The turn ended between the tap and the call (#666): the words go as the next message.
+            return await send(text)
         } catch {
             banner = error.localizedDescription
+            return text
         }
     }
+
+    /// A queued message sent into the running turn (#546), as the composer's Steer now sends one. It leaves the queue
+    /// first, so the turn's end (`drainQueue`) can't send it as well. One the gateway doesn't take ("rejected": its turn
+    /// had ended) goes back where it was and is the next message. A steer that fails goes back too: still queued, said,
+    /// while the turn runs; sent as the next message if the turn ended while the steer was out.
+    public func steerQueued(_ id: UUID) async {
+        guard isRunning, let i = queue.firstIndex(where: { $0.id == id }) else { return }
+        let message = queue.remove(at: i)
+        do {
+            guard try await steerSending(message.text) == "rejected" else { return }
+            queue.insert(message, at: min(i, queue.count))
+            if !isRunning { drainQueue() }
+        } catch let e as RPCError where runtime.sessionAuthority && e.message == "stale_generation" {
+            // The turn ended between the tap and the call (#666): the words wait their turn in the queue, said nowhere.
+            queue.insert(message, at: min(i, queue.count))
+            if !isRunning { drainQueue() }
+        } catch {
+            queue.insert(message, at: min(i, queue.count))
+            if isRunning { banner = error.localizedDescription } else { drainQueue() }
+        }
+    }
+
+    /// session.steer, and the gateway's answer: "queued" when the running turn takes the words (they go in after its
+    /// current tool calls), "rejected" when no turn takes them, for the client to send as its next prompt. A steer row
+    /// only for words a turn took.
+    ///
+    /// On Hermes's session authority (#666) a steer names the running turn by its execution, and a plain "rejected" may
+    /// have reached the bot (one whose acknowledgement came late): only one no agent saw (`delivered: false`) is
+    /// "rejected" here, to be sent again. The other is "unsure": not sent again, and said in the chat.
+    private func steerSending(_ text: String) async throws -> String {
+        var params: [String: JSONValue] = ["session_id": .string(runtimeID), "text": .string(text)]
+        if runtime.sessionAuthority {
+            guard let generation = executionGeneration else {
+                throw RPCError(code: 4001, message: "stale_generation", data: ["reason": "stale_generation"])
+            }
+            params["execution_generation"] = .number(Double(generation))
+        }
+        let r = try await rpc("session.steer", params)
+        if r["voice_stopped"]?.boolValue == true { return "stopped" }
+        var status = r["status"]?.stringValue ?? "queued"
+        if runtime.sessionAuthority, status == "rejected", r["delivered"]?.boolValue != false {
+            status = "unsure"
+            items.append(TranscriptItem(id: UUID().uuidString, kind: .system(text: Self.steerUnsureLine, symbol: "questionmark.circle")))
+        } else if status != "rejected" {
+            items.append(TranscriptItem(id: UUID().uuidString, kind: .steer(text: text, status: status)))
+        }
+        return status
+    }
+
+    nonisolated static let steerUnsureLine = "This may not have reached the bot. It was sent as the turn ended."
 
     public func removeQueued(_ id: UUID) { queue.removeAll { $0.id == id } }
     public func updateQueued(_ id: UUID, text: String) { if let i = queue.firstIndex(where: { $0.id == id }) { queue[i].text = text } }
@@ -1317,7 +1885,7 @@ public final class ChatSession: @MainActor Identifiable, ChatIdentity {
     public func beginQuickAnswers() async {
         guard VoiceSettings.quickAnswers, !quickAnswersOn else { return }
         let before = ["reasoning": info?.reasoningEffort ?? "", "fast": (info?.fast ?? false) ? "on" : "off"]
-        if !storedID.isEmpty { UserDefaults.standard.set(before, forKey: Self.quickRestoreKey(storedID)) }
+        if !storedID.isEmpty, !runtime.isEphemeral { UserDefaults.standard.set(before, forKey: Self.quickRestoreKey(storedID)) }
         quickAnswersOn = true
         try? await setReasoning(Self.quickEffort)
         try? await setFast(true)
@@ -1345,8 +1913,19 @@ public final class ChatSession: @MainActor Identifiable, ChatIdentity {
     }
 
     public func rename(_ newTitle: String) async {
-        if let r = try? await rpc("session.title", ["session_id": .string(runtimeID), "title": .string(newTitle)]), let t = r["title"]?.stringValue { title = t }
-        Self.markRenamedByPerson(storedID)
+        if runtime.sessionAuthority {
+            // Hermes's session authority renames by session.mutate (#666); a refusal is said, without its code.
+            do {
+                let r = try await mutate("rename", ["title": .string(newTitle)])
+                if let t = r["title"]?.stringValue { title = t }
+            } catch {
+                items.append(TranscriptItem(id: UUID().uuidString, kind: .system(text: Self.renameFailedLine, symbol: "exclamationmark.circle")))
+                return
+            }
+        } else if let r = try? await rpc("session.title", ["session_id": .string(runtimeID), "title": .string(newTitle)]), let t = r["title"]?.stringValue {
+            title = t
+        }
+        if !runtime.isEphemeral { Self.markRenamedByPerson(storedID) }
         // The chat list draws the gateway's stored rows, read again on this notice: without it
         // the row kept the old name until the next open or close (seen at once on the Mac,
         // where the list sits beside the chat).
@@ -1382,6 +1961,53 @@ public final class ChatSession: @MainActor Identifiable, ChatIdentity {
         }
     }
 
+    /// A card for one of the session authority's prompts (an event's payload, or an entry of a snapshot's `prompts`),
+    /// in the shape the cards read: an approval's `request_id` is its prompt id, so a notification or the watch that
+    /// names the request finds it. Nil for anything else (#665).
+    nonisolated static func promptCard(_ prompt: JSONValue, sessionID: String) -> PendingCard? {
+        guard let id = prompt["prompt_id"]?.stringValue, !id.isEmpty, let generation = prompt["execution_generation"]?.intValue else { return nil }
+        var params: [String: JSONValue] = ["session_id": .string(sessionID)]
+        let method: String
+        switch prompt["kind"]?.stringValue {
+        case "approval":
+            method = "approval"
+            params["request_id"] = .string(id)
+            for key in ["command", "description", "choices", "timeout_s"] { if let v = prompt[key], !v.isNull { params[key] = v } }
+        case "clarify":
+            method = "clarify"
+            for key in ["question", "choices", "multi_select", "timeout_s"] { if let v = prompt[key], !v.isNull { params[key] = v } }
+        default:
+            return nil
+        }
+        var card = PendingCard(id: id, method: method, params: .object(params))
+        card.promptID = id
+        card.generation = generation
+        return card
+    }
+
+    /// The newest execution the session authority has shown this chat. A prompt card from an earlier one can't be
+    /// answered any more (the gateway would say `stale_generation`), so it goes, as the gateway's own settle would
+    /// take it.
+    private func noteGeneration(_ generation: Int?) {
+        guard let generation, generation > (executionGeneration ?? Int.min) else { return }
+        executionGeneration = generation
+        for card in cards where card.viaPrompt && (card.generation ?? generation) < generation { noLongerWaiting(card) }
+    }
+
+    /// A prompt card whose turn is over: it goes, with a line saying so.
+    private func noLongerWaiting(_ card: PendingCard) {
+        noteRemovedHere(card)
+        cards.removeAll { $0.id == card.id }
+        cardShownAt[card.id] = nil
+        cardWent()
+        runtime.cardNotifier?.cardSettled(card, chat: self)
+        items.append(TranscriptItem(id: UUID().uuidString, kind: .system(text: Self.noLongerWaitingLine(card), symbol: "clock")))
+    }
+
+    nonisolated static func noLongerWaitingLine(_ card: PendingCard) -> String {
+        card.method == "approval" ? "This approval is no longer waiting" : "This question is no longer waiting"
+    }
+
     /// When each card appeared here.
     private var cardShownAt: [String: Date] = [:]
     /// When the gateway last said each card's question was waiting: when the question came, or
@@ -1400,6 +2026,97 @@ public final class ChatSession: @MainActor Identifiable, ChatIdentity {
     /// last, put it back.
     private var listsAskedAt: [UUID: Date] = [:]
     private var lastApprovalCheck = Date.distantPast
+    /// The newest execution the session authority has shown this chat (a snapshot, a prompt): a prompt card from an
+    /// earlier one can no longer be answered (#665).
+    private(set) var executionGeneration: Int?
+    /// The session's revision as the session authority last showed it (a create, a resume, `session.info`, a mutate's
+    /// answer): what a `session.mutate` presents (#666).
+    private(set) var revision: Int?
+    /// This socket's subscription to the session, from the create or the last resume: what `session.detach` names (#666).
+    private(set) var subscriptionID: String?
+
+    private func noteRevision(_ r: Int?) {
+        guard let r, r > (revision ?? Int.min) else { return }
+        revision = r
+    }
+
+    /// What a create's or a resume's answer says of the session on the authority's wire: its execution, its revision,
+    /// and this socket's subscription (#666).
+    private func noteAttach(_ r: JSONValue) {
+        guard runtime.sessionAuthority else { return }
+        takeFences(revision: r["revision"]?.intValue, generation: r["execution_generation"]?.intValue)
+        if let s = r["subscription_id"]?.stringValue, !s.isEmpty { subscriptionID = s }
+    }
+
+    /// The gateway's present word on the session (an attach's answer, a refusal's data), which comes in socket order:
+    /// taken as it is, lower or not, since a gateway that restarted counts again from its own numbers. `session.info`
+    /// and a mutate's answer only move them on (`noteRevision`, `noteGeneration`) (#666).
+    private func takeFences(revision r: Int?, generation g: Int?) {
+        if let r { revision = r }
+        guard let g else { return }
+        if let old = executionGeneration, g < old {
+            // The executions this chat knew are gone: their prompt cards go quietly, and the snapshot's `prompts` bring
+            // back any still open.
+            forgetPromptCards()
+            executionGeneration = g
+        } else {
+            noteGeneration(g)
+        }
+    }
+
+    /// Every card of the session authority's prompts goes, with no line and nothing kept as answered here.
+    private func forgetPromptCards() {
+        let gone = cards.filter(\.viaPrompt)
+        guard !gone.isEmpty else { return }
+        cards.removeAll { $0.viaPrompt }
+        for card in gone {
+            cardShownAt[card.id] = nil
+            runtime.cardNotifier?.cardSettled(card, chat: self)
+        }
+        cardWent()
+    }
+
+    /// A `session.mutate` of this chat, with its fences; the answer's revision is kept (#666).
+    private func mutate(_ operation: String, _ payload: [String: JSONValue], needsGeneration: Bool = false,
+                        beforeRetry: (@MainActor () async throws -> Void)? = nil) async throws -> JSONValue {
+        let r = try await SessionMutation.send(
+            call: { [unowned self] method, params in try await self.rpc(method, params) },
+            sessionID: runtimeID, operation: operation, payload: payload, revision: revision, generation: executionGeneration,
+            needsGeneration: needsGeneration, beforeRetry: beforeRetry,
+            fences: { [unowned self] rev, gen in self.takeFences(revision: rev, generation: gen) })
+        noteRevision(r["revision"]?.intValue)
+        return r
+    }
+
+    /// Leaves the chat on the gateway (the chat list's close; `GatewayRuntime.closeChat`). On the session authority's
+    /// wire it detaches this socket's subscription, ending the chat as the old wire's close does ("tui_close", #666);
+    /// a late detach of an old subscription only answers `detached: false`. On the old wire, `session.close`, sent as
+    /// before. Nobody waits on its answer.
+    func close() async {
+        if runtime.sessionAuthority {
+            guard let subscriptionID else { return }
+            _ = try? await rpc("session.detach", ["session_id": .string(runtimeID), "subscription_id": .string(subscriptionID),
+                                                  "end_reason": "tui_close"])
+        } else {
+            // As closeChat sent it: straight to the socket, without waiting for a ready, so a late close can't land on
+            // the chat opened again meanwhile.
+            _ = try? await runtime.socket.call("session.close", params: GatewayRuntime.params(["session_id": .string(runtimeID)], owner: profile))
+        }
+    }
+
+    nonisolated static let renameFailedLine = "The chat couldn't be renamed."
+
+    /// The name of the one tool call still running in this turn, nil when none or several (#666). Only the turn's own
+    /// count, those after the person's last message: a row an earlier turn left running (an interrupt, a dropped
+    /// socket) isn't asking.
+    private func soleRunningTool() -> String? {
+        let start = items.lastIndex { if case .user = $0.kind { return true }; return false }.map { $0 + 1 } ?? 0
+        let running = items[start...].compactMap { item -> String? in
+            if case .tool(let a) = item.kind, a.status == .running { return a.name }
+            return nil
+        }
+        return running.count == 1 ? running[0] : nil
+    }
     /// A card this fresh is never taken for answered elsewhere.
     static let cardGrace: TimeInterval = 2
 
@@ -1520,6 +2237,10 @@ public final class ChatSession: @MainActor Identifiable, ChatIdentity {
         if card.method == "approval" {
             runtime.pushRegistrar?.noteAnswer(requestID: card.approval?.requestId ?? card.id, session: storedID, runtime: runtime)
         }
+        if card.viaPrompt, let promptID = card.promptID, let generation = card.generation {
+            await respondToPrompt(card, promptID: promptID, generation: generation, result: result)
+            return
+        }
         if card.viaApprovalRPC, let rid = card.approval?.requestId {
             var params: [String: JSONValue] = ["session_id": .string(runtimeID), "request_id": .string(rid)]
             params["choice"] = result["choice"] ?? "deny"
@@ -1531,6 +2252,49 @@ public final class ChatSession: @MainActor Identifiable, ChatIdentity {
         if card.method == "approval" {
             items.append(TranscriptItem(id: UUID().uuidString, kind: .system(text: "Approval: \(result["choice"]?.stringValue ?? "?")", symbol: "checkmark.shield")))
         }
+    }
+
+    /// An answer to one of the session authority's prompts: the four keys it takes and no other (#665). A turn already
+    /// over leaves the card down with a line; one answered elsewhere says so; a socket not attached again yet (an
+    /// answer from a notification right after a reconnect) waits once for the chat's re-attach. Anything else puts the
+    /// card back, with why.
+    private func respondToPrompt(_ card: PendingCard, promptID: String, generation: Int, result: JSONValue) async {
+        let isApproval = card.method == "approval"
+        var params: [String: JSONValue] = ["session_id": .string(runtimeID), "execution_generation": .number(Double(generation)),
+                                           "prompt_id": .string(promptID)]
+        if isApproval { params["choice"] = result["choice"] ?? "deny" } else { params["answer"] = result["answer"] ?? "" }
+        for attempt in 0..<2 {
+            do {
+                let r = try await rpc(isApproval ? "approval.respond" : "clarify.respond", params)
+                if r["status"]?.stringValue == "already_resolved" {
+                    items.append(TranscriptItem(id: UUID().uuidString, kind: .system(text: "Answered on another device", symbol: "checkmark.shield")))
+                } else if isApproval {
+                    items.append(TranscriptItem(id: UUID().uuidString, kind: .system(text: "Approval: \(result["choice"]?.stringValue ?? "?")", symbol: "checkmark.shield")))
+                }
+                return
+            } catch let e as RPCError where e.message == "stale_generation" {
+                items.append(TranscriptItem(id: UUID().uuidString, kind: .system(text: Self.noLongerWaitingLine(card), symbol: "clock")))
+                return
+            } catch let e as RPCError where e.message == "permission_denied" && attempt == 0 {
+                let deadline = Date().addingTimeInterval(10)
+                while isResuming, Date() < deadline { try? await Task.sleep(for: .milliseconds(250)) }
+            } catch {
+                restoreCard(card)
+                items.append(TranscriptItem(id: UUID().uuidString, kind: .error(text: error.localizedDescription)))
+                return
+            }
+        }
+        restoreCard(card)
+    }
+
+    /// A prompt card whose answer didn't go: up again, asking for attention, with no second notification.
+    private func restoreCard(_ card: PendingCard) {
+        guard !cards.contains(where: { $0.id == card.id }) else { return }
+        removedHereAt[card.id] = nil
+        cards.append(card)
+        cardShownAt[card.id] = Date()
+        runtime.setAttention(storedID: storedID, needed: true)
+        activity.update(for: self, attention: true)
     }
 
     private func cancelCard(id: String, reason: String) {
@@ -1637,7 +2401,13 @@ public final class ChatSession: @MainActor Identifiable, ChatIdentity {
         case "session.usage":
             if let u = try? p["usage"]?.decode(Usage.self) { usage = u; activity.update(for: self, attention: !cards.isEmpty) }
         case "session.info":
-            if let i = try? p.decode(SessionLiveInfo.self) { info = i; if let t = i.title, !t.isEmpty { title = t }; if let r = i.running { isRunning = r } }
+            // Hermes's session authority's are mostly partial (a claim's: the running state, the generation, the
+            // revision), so they're merged; the old wire's are the whole projection, taken as they are (#666).
+            if let i = try? p.decode(SessionLiveInfo.self) {
+                info = runtime.sessionAuthority ? SessionLiveInfo.merging(info, i) : i
+                if let t = i.title, !t.isEmpty { title = t }; if let r = i.running { isRunning = r }
+            }
+            if runtime.sessionAuthority { noteGeneration(p["execution_generation"]?.intValue); noteRevision(p["revision"]?.intValue) }
         case "session.title":
             if let t = p["title"]?.stringValue { title = t }
         case "status.update":
@@ -1679,6 +2449,7 @@ public final class ChatSession: @MainActor Identifiable, ChatIdentity {
         case let t where t.hasPrefix("subagent."):
             updateSubagent(t, p)
         case "error":
+            streamFlush?.cancel(); streamFlush = nil
             appendError(p["message"]?.stringValue ?? "Unknown error")
             endPhase = "error"
             isRunning = false
@@ -1690,9 +2461,26 @@ public final class ChatSession: @MainActor Identifiable, ChatIdentity {
             if let t = p["text"]?.stringValue, !t.trimmingCharacters(in: .whitespaces).isEmpty { banner = t; bannerIsReconnect = false }
         case "notification.clear":
             banner = nil
+        case "approval.request", "clarify.request":
+            // Hermes's session authority asks by event, not by request (#665).
+            guard runtime.sessionAuthority, var card = Self.promptCard(p, sessionID: runtimeID) else { break }
+            noteGeneration(card.generation)
+            guard removedHereAt[card.id] == nil, (card.generation ?? 0) >= (executionGeneration ?? 0) else { break }
+            // The authority's approval names no tool. It's asked from inside a tool call whose start this chat has,
+            // so the one tool still running is the one asking; with none or several, the card has no tool line (#666).
+            if card.method == "approval", let tool = soleRunningTool(), case .object(var params) = card.params, params["tool_name"] == nil {
+                params["tool_name"] = .string(tool)
+                card.params = .object(params)
+            }
+            addCard(card)
+        case "approval.settled", "clarify.settled":
+            // Answered here, the card went already; answered elsewhere, timed out or its turn over, it goes now.
+            guard runtime.sessionAuthority, let id = p["prompt_id"]?.stringValue, let card = cards.first(where: { $0.id == id }) else { break }
+            settleElsewhere(card)
         case "request.cancel":
             cancelCard(id: p["id"]?.stringValue ?? "", reason: p["reason"]?.stringValue ?? "cancelled")
         case "session.reclaimed":
+            streamFlush?.cancel(); streamFlush = nil
             stale = true
             isRunning = false
             banner = "The gateway reclaimed this session (\(p["reason"]?.stringValue ?? "idle")). It will resume on your next message."
@@ -1755,7 +2543,7 @@ public final class ChatSession: @MainActor Identifiable, ChatIdentity {
         case "session.reclaimed":
             // Only when the snapshot is of the session that went: a resume after it is on a new one.
             if (p["session_id"]?.stringValue ?? ev.sessionID) == runtimeID { handle(event: ev) }
-        case "session.usage", "notification.show", "notification.clear":
+        case "session.usage", "notification.show", "notification.clear", "approval.settled", "clarify.settled":
             handle(event: ev)
         default:
             // The rest change only what the snapshot shows.
@@ -1795,6 +2583,7 @@ public final class ChatSession: @MainActor Identifiable, ChatIdentity {
     }
 
     private func beginStreaming() {
+        streamFlush?.cancel(); streamFlush = nil
         if streamingItemID == nil && !isRunning { sealedTurnText = "" }
         if turnStartedAt == nil {
             turnStartedAt = Date()
@@ -1861,6 +2650,7 @@ public final class ChatSession: @MainActor Identifiable, ChatIdentity {
     }
 
     private func sealStreamingForTool() {
+        streamFlush?.cancel(); streamFlush = nil
         guard let id = streamingItemID, let idx = items.lastIndex(where: { $0.id == id }) else { return }
         sealedTurnText += assembler.text
         // A step that only thought keeps its row, the Reasoning card alone (`isThinkingOnly`):
@@ -1875,6 +2665,7 @@ public final class ChatSession: @MainActor Identifiable, ChatIdentity {
     /// Returns the index of the turn's final assistant bubble, if one is on screen.
     @discardableResult
     private func finishStreaming(finalText: String?, gatewayReasoning: String? = nil, previewed: Bool = false) -> Int? {
+        streamFlush?.cancel(); streamFlush = nil
         // The final reply already went out as an interim message (some runtimes send every
         // finished message that way) and nothing streamed since: the gateway says so with
         // `response_previewed`, and the bubble on screen is the reply. Appending it again showed

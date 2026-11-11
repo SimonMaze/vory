@@ -50,13 +50,14 @@ struct BotsView: View {
                 #if DEBUG
                 if ProcessInfo.processInfo.arguments.contains("-vory-shape-grid") { ShapeSeatGrid() }
                 if ProcessInfo.processInfo.arguments.contains("-vory-motion-demo") { MotionDemoView() }
-                // The brief's measuring scene (section 6): six bots on screen, one of them working.
+                // The measuring scene: six bots on screen, one of them working.
                 if ProcessInfo.processInfo.arguments.contains("-vory-motion-bench") { MotionDemoView(bench: true) }
                 #endif
             }
             .pageToolbar {
                 ToolbarItem(placement: .topBarTrailing) {
-                    if !MorphTopBar.active(model) { Button { showNewBot = true } label: { Image(systemName: "plus") }.accessibilityLabel("New bot") }
+                    // No New bot in the demo (#494): its look editor wrote the person's own bot's look.
+                    if !MorphTopBar.active(model), !model.isInDemo { Button { showNewBot = true } label: { Image(systemName: "plus") }.accessibilityLabel("New bot") }
                 }
             }
             .sheet(isPresented: $showNewBot) { if let rt = model.runtime { NewBotSheet(runtime: rt).sheetFrame().withAppModel() } }
@@ -74,7 +75,7 @@ struct BotsView: View {
             .task(id: model.runtime?.connection.id) { await load() }
             .onChange(of: model.pageRequest) { _, r in
                 guard let r, r.kind == .botsNewBot else { return }
-                model.pageRequest = nil; showNewBot = true
+                model.pageRequest = nil; showNewBot = !model.isInDemo
             }
         }
     }
@@ -117,7 +118,10 @@ struct BotsView: View {
             if rt.profiles.isEmpty {
                 Text("No profiles reported by this gateway.").foregroundStyle(.secondary).font(.footnote).padding()
             }
+            // Words, not a control: where the line fits on one line it's 16 pt tall, and the audit took it for a tap target
+            // that's too small (#652). VoiceOver still reads it.
             Text("Each bot is a Hermes profile: its own SOUL.md, model and sessions. \(DeviceWords.Tap) one for its chats.")
+                .accessibilityRespondsToUserInteraction(false)
                 .font(.footnote).foregroundStyle(.secondary).multilineTextAlignment(.center)
                 .padding(.horizontal, 28).padding(.top, 14)
             if capabilities != nil, !rooms.isEmpty {
@@ -150,7 +154,8 @@ struct BotsView: View {
             Button { rt.selectedProfile = p.name } label: { Label("Make active", systemImage: "checkmark.circle") }
         }
         Divider()
-        Button { editing = p } label: { Label("Edit bot…", systemImage: "pencil") }
+        // Not in the demo (#494): Edit Bot has the look editor, which wrote the person's own bot's look.
+        if !rt.isEphemeral { Button { editing = p } label: { Label("Edit bot…", systemImage: "pencil") } }
         if renameSupported, p.isDefault != true {
             Button { renaming = p } label: { Label("Rename bot…", systemImage: "folder.badge.gearshape") }
         }
@@ -477,6 +482,8 @@ struct BotDetailView: View {
     @Environment(AppModel.self) private var model
     var profile: ProfileInfo
     @State private var sessions: [StoredSession] = []
+    /// The gateway has answered for the list (or there is none to ask): until then it is not known to be empty.
+    @State private var loaded = false
     @State private var error: String?
     @State private var pendingDelete: StoredSession?
     @State private var composing = false
@@ -493,7 +500,7 @@ struct BotDetailView: View {
             }
             Section {
                 if let error { Text(error).foregroundStyle(.red).font(.footnote) }
-                if sessions.isEmpty, error == nil {
+                if sessions.isEmpty, loaded, error == nil {
                     Text("No chats with this bot yet.").foregroundStyle(.secondary).font(.footnote)
                 }
                 ForEach(sessions) { s in
@@ -525,11 +532,12 @@ struct BotDetailView: View {
     }
 
     private func load() async {
-        guard let rt = model.runtime else { return }
+        guard let rt = model.runtime else { loaded = true; return }
         do {
             let r: SessionListResponse = try await rt.api.get("/api/sessions", query: [URLQueryItem(name: "order", value: "recent"), URLQueryItem(name: "limit", value: "100")], profile: profile.name)
             sessions = r.sessions
             error = nil
+            loaded = true
         } catch { self.error = error.localizedDescription }
     }
 

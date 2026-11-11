@@ -13,15 +13,32 @@ struct ChatsSplitPage: View {
     @Environment(AppModel.self) private var model
     @Environment(\.windowGeometry) private var windowGeometry
     @Environment(\.wideLayout) private var wide
+    @Environment(\.reservedRegions) private var regions
     @State private var columns = NavigationSplitViewVisibility.doubleColumn
+    @Environment(\.scenePhase) private var scenePhase
+    /// The columns as they stood when the scene went into the background, kept until it is active again. In the
+    /// background the system lays the scene out for its snapshot at its own compact size class (the open Duo on its
+    /// side), the split view collapses there, and it came back showing the chat alone, the list column gone (#537). For
+    /// that trip the split view's writes are let go, and the page's own visibility is put back once the scene is
+    /// active. While the scene is active (a narrowed iPad window, a turn, the sidebar button) every write is taken.
+    @State private var columnsBeforeBackground: NavigationSplitViewVisibility?
+    private var columnsBinding: Binding<NavigationSplitViewVisibility> {
+        Binding(get: { columns }, set: { if columnsBeforeBackground == nil { columns = $0 } })
+    }
+    /// The split view's leading edge in the window (a bar down the leading side moves it in).
+    @State private var leading: CGFloat = 0
 
     /// The list's column: 380 pt where the window is wide enough for both columns at that (the
     /// iPad, the open Duo in landscape), narrower on a window like the open Duo in portrait
     /// (669 pt), where a 380 pt list left the split view no room for the chat and it put the
     /// list over the chat as a dimmed overlay instead of beside it.
+    /// With a fold up the window (the open Duo half open like a book) the list ends at the
+    /// fold instead, so the fold is the line between the list and the chat rather than running
+    /// through the chat (Duo stage 2, `ReservedRegions.listWidth`).
     private var listWidth: (min: CGFloat, ideal: CGFloat) {
         let w = windowGeometry.bounds.width
-        return (280, min(380, max(280, (w * 0.42).rounded(.down))))
+        let atFold = regions.listWidth(leading: leading, range: 280...480)
+        return (280, atFold ?? min(380, max(280, (w * 0.42).rounded(.down))))
     }
 
     /// The model's path as a binding: the list selects into it, the detail stack shows it.
@@ -31,16 +48,32 @@ struct ChatsSplitPage: View {
 
     var body: some View {
         if wide {
-            NavigationSplitView(columnVisibility: $columns) {
+            NavigationSplitView(columnVisibility: columnsBinding) {
                 ChatListView(detailPath: chatPath)
                     .onChange(of: model.chatPath.isEmpty, initial: true) { _, empty in
                         model.chatsPathOpen = !empty; model.tabAtRoot[.chats] = empty
                     }
+                    #if os(iOS)
+                    // On the Duo's side (or as a book) with a chat open and the list hidden, the split's sidebar toggle
+                    // stood in the chat page's bar over its face (Back, or the split's edge swipe, brings the list back,
+                    // as before). It's this column's own item, shown in the chat's bar while the list is hidden: taken
+                    // off the chat's page or the detail column it stayed (2026-10-31), so it comes off here, and only
+                    // then. Beside the chat the list keeps its "Hide Sidebar", after Back the empty detail keeps "Show
+                    // Sidebar", and the iPad keeps both (#555).
+                    .toolbar(removing: model.tabBarVertical && !model.chatPath.isEmpty && columns == .detailOnly ? .sidebarToggle : nil)
+                    #endif
+                    // The column's width last, outside everything else on the column: put inside the toolbar's
+                    // removal, the split no longer read it and gave the list its own 320 pt (2026-11-01).
                     .navigationSplitViewColumnWidth(min: listWidth.min, ideal: listWidth.ideal, max: 480)
             } detail: {
                 ChatDetailStack(path: chatPath) { NoChatPlaceholder() }
             }
             .navigationSplitViewStyle(.balanced)
+            .onGeometryChange(for: CGFloat.self) { $0.frame(in: .global).minX } action: { leading = $0 }
+            .onChange(of: scenePhase) { _, phase in
+                if phase == .background, columnsBeforeBackground == nil { columnsBeforeBackground = columns }
+                if phase == .active, let held = columnsBeforeBackground { columnsBeforeBackground = nil; columns = held }
+            }
         } else {
             // One column (a phone, the closed Duo, the open Duo upright, a narrow window): the
             // list's own stack on the same path. The split view collapsed to one column left
@@ -57,10 +90,14 @@ struct ChatsSplitPage: View {
                         model.chatsPathOpen = !empty; model.tabAtRoot[.chats] = empty
                     }
                     .navigationDestination(for: ChatRoute.self) { route in ConversationView(route: route).countsChatOnScreen() }
-                    .navigationDestination(for: RoomRoute.self) { r in RoomView(room: r.room, initialText: r.initialText).countsChatOnScreen(room: true) }
+                    .navigationDestination(for: RoomRoute.self) { r in RoomView(room: r.room, initialText: r.initialText).countsChatOnScreen(room: true).closedChatsRoom() }
                     // The bar follows a chat's push and pop in this stack (`MorphState.follow`).
                     .chatsStackProbe()
             }
+            // Two columns again for the next wide window: collapsing on a turn upright, the split view writes "detail only",
+            // and with the pages no longer rebuilt as the bar moves (#533) the next turn on its side came back with the
+            // list hidden (#547). The open chat is the model's path, so nothing the person had goes with it.
+            .onAppear { columns = .doubleColumn }
         }
     }
 }
@@ -107,6 +144,16 @@ struct CountsChatOnScreen: ViewModifier {
 
 extension View {
     func countsChatOnScreen(room: Bool = false) -> some View { modifier(CountsChatOnScreen(room: room)) }
+
+    /// A group chat on the Chats stack keeps its place on the closed Duo, where the stack has no room (`ClosedChatsRoom`;
+    /// iPhone only).
+    @ViewBuilder func closedChatsRoom() -> some View {
+        #if os(iOS)
+        modifier(ClosedChatsRoom())
+        #else
+        self
+        #endif
+    }
 
     /// Hands the Chats stack to the morph bar (iPhone only; the Mac has no bar).
     @ViewBuilder func chatsStackProbe() -> some View {

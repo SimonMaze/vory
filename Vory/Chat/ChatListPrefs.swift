@@ -1,5 +1,4 @@
 import SwiftUI
-import Combine
 
 /// The chat list's settings, backed by UserDefaults under the same keys the rest of the app
 /// uses (Settings toggles some of them): read once, written on change, and refreshed from the
@@ -20,10 +19,48 @@ final class ChatListPrefs {
     var showArchived: Bool { didSet { if showArchived != oldValue { d.set(showArchived, forKey: "chats.filter.archived") } } }
     var sortKey: String { didSet { if sortKey != oldValue { d.set(sortKey, forKey: "chats.sort") } } }
     var groupsOnly: Bool { didSet { if groupsOnly != oldValue { d.set(groupsOnly, forKey: "chats.filter.groups") } } }
-    var projectFilter: String { didSet { if projectFilter != oldValue { d.set(projectFilter, forKey: "chats.filter.project") } } }
+    var projectFilter: String { didSet { if projectFilter != oldValue { keepOwn(projectFilter, "chats.filter.project") } } }
     var byProject: Bool { didSet { if byProject != oldValue { d.set(byProject, forKey: "chats.byProject") } } }
-    var collapsedRaw: String { didSet { if collapsedRaw != oldValue { d.set(collapsedRaw, forKey: "chats.byProject.collapsed") } } }
-    var archivedRoomsRaw: String { didSet { if archivedRoomsRaw != oldValue { d.set(archivedRoomsRaw, forKey: "chats.archivedRooms") } } }
+    var collapsedRaw: String { didSet { if collapsedRaw != oldValue { keepOwn(collapsedRaw, "chats.byProject.collapsed") } } }
+    var archivedRoomsRaw: String { didSet { if archivedRoomsRaw != oldValue { keepOwn(archivedRoomsRaw, "chats.archivedRooms") } } }
+    /// The Scheduled section open (#673): closed until it's opened, then as it was left, on this device. Not a setting.
+    var scheduledOpen: Bool { didSet { if scheduledOpen != oldValue { d.set(scheduledOpen, forKey: "chats.scheduled.open") } } }
+    /// While the demo runs, the filter by project, the folded projects and the archived rooms are the demo's, for its life
+    /// (#494): its projects and rooms are not the person's, and kept they left the person's list filtered to a project
+    /// they don't have. Leaving it brings the person's own back.
+    var inDemo = false {
+        didSet {
+            guard inDemo != oldValue else { return }
+            if inDemo { projectFilter = ""; collapsedRaw = ""; archivedRoomsRaw = "" } else { refresh() }
+        }
+    }
+    /// One of the three, kept outside the demo, and only when it is not what is kept already: coming back from the demo
+    /// puts the person's own back from the defaults and wrote them over themselves, an absent one as "" (#494). Never
+    /// while the defaults are read back (`refresh`), and "what is kept" is read as the prefs read it: a number or a Bool
+    /// under the key reads as no value there, while `string(forKey:)` made it "1", so leaving the demo wrote "" over it (#512).
+    private func keepOwn(_ value: String, _ key: String) {
+        guard !inDemo, !refreshing, value != (d.object(forKey: key) as? String ?? "") else { return }
+        #if DEBUG
+        Self.traceOwnWrite(key, was: d.object(forKey: key), now: value, inDemo: inDemo)
+        #endif
+        d.set(value, forKey: key)
+    }
+    /// While `refresh` reads the defaults back: what it sets is what is kept, so nothing is written (#512).
+    @ObservationIgnored private var refreshing = false
+    #if DEBUG
+    /// The writes of the three keys through `keepOwn`, the last eight, each with the frames that called it (symbol names
+    /// only), and how many there have been: the no-trace tests name them when the person's own keys changed (#512).
+    static private(set) var ownWritesForTests: [String] = []
+    static private(set) var ownWriteCountForTests = 0
+    private static func traceOwnWrite(_ key: String, was: Any?, now: String, inDemo: Bool) {
+        let frames = Thread.callStackSymbols.dropFirst(2).prefix(6).map { line in
+            line.split(separator: " ", omittingEmptySubsequences: true).dropFirst(3).first.map(String.init) ?? "?"
+        }
+        ownWriteCountForTests += 1
+        ownWritesForTests.append("\(key): \(was.map { "\($0)" } ?? "absent") -> \"\(now)\" (inDemo \(inDemo)) from \(frames.joined(separator: " < "))")
+        if ownWritesForTests.count > 8 { ownWritesForTests.removeFirst(ownWritesForTests.count - 8) }
+    }
+    #endif
     var botColorsRaw: String { didSet { if botColorsRaw != oldValue { d.set(botColorsRaw, forKey: BotColors.storageKey) } } }
     var botAvatarsRaw: String { didSet { if botAvatarsRaw != oldValue { d.set(botAvatarsRaw, forKey: BotAvatarStore.storageKey) } } }
     var glassAll: Bool { didSet { if glassAll != oldValue { d.set(glassAll, forKey: BotAvatarStore.glassAllKey) } } }
@@ -42,6 +79,7 @@ final class ChatListPrefs {
         byProject = d.object(forKey: "chats.byProject") as? Bool ?? false
         collapsedRaw = d.object(forKey: "chats.byProject.collapsed") as? String ?? ""
         archivedRoomsRaw = d.object(forKey: "chats.archivedRooms") as? String ?? ""
+        scheduledOpen = d.bool(forKey: "chats.scheduled.open")
         botColorsRaw = d.object(forKey: BotColors.storageKey) as? String ?? ""
         botAvatarsRaw = d.object(forKey: BotAvatarStore.storageKey) as? String ?? ""
         glassAll = d.object(forKey: BotAvatarStore.glassAllKey) as? Bool ?? false
@@ -52,6 +90,8 @@ final class ChatListPrefs {
 
     /// Another screen wrote one of the keys: take the new value, only where it differs.
     private func refresh() {
+        refreshing = true
+        defer { refreshing = false }
         let new_allBots = d.object(forKey: "chats.allBots") as? Bool ?? false; if new_allBots != allBots { allBots = new_allBots }
         let new_aiTitles = d.object(forKey: ChatSummarizer.titlesKey) as? Bool ?? ChatSummarizer.titlesOn; if new_aiTitles != aiTitles { aiTitles = new_aiTitles }
         let new_aiPreviews = d.object(forKey: ChatSummarizer.previewsKey) as? Bool ?? ChatSummarizer.previewsOn; if new_aiPreviews != aiPreviews { aiPreviews = new_aiPreviews }
@@ -61,10 +101,13 @@ final class ChatListPrefs {
         let new_showArchived = d.object(forKey: "chats.filter.archived") as? Bool ?? true; if new_showArchived != showArchived { showArchived = new_showArchived }
         let new_sortKey = d.object(forKey: "chats.sort") as? String ?? "recent"; if new_sortKey != sortKey { sortKey = new_sortKey }
         let new_groupsOnly = d.object(forKey: "chats.filter.groups") as? Bool ?? false; if new_groupsOnly != groupsOnly { groupsOnly = new_groupsOnly }
-        let new_projectFilter = d.object(forKey: "chats.filter.project") as? String ?? ""; if new_projectFilter != projectFilter { projectFilter = new_projectFilter }
         let new_byProject = d.object(forKey: "chats.byProject") as? Bool ?? false; if new_byProject != byProject { byProject = new_byProject }
-        let new_collapsedRaw = d.object(forKey: "chats.byProject.collapsed") as? String ?? ""; if new_collapsedRaw != collapsedRaw { collapsedRaw = new_collapsedRaw }
-        let new_archivedRoomsRaw = d.object(forKey: "chats.archivedRooms") as? String ?? ""; if new_archivedRoomsRaw != archivedRoomsRaw { archivedRoomsRaw = new_archivedRoomsRaw }
+        let new_scheduledOpen = d.bool(forKey: "chats.scheduled.open"); if new_scheduledOpen != scheduledOpen { scheduledOpen = new_scheduledOpen }
+        if !inDemo {
+            let new_projectFilter = d.object(forKey: "chats.filter.project") as? String ?? ""; if new_projectFilter != projectFilter { projectFilter = new_projectFilter }
+            let new_collapsedRaw = d.object(forKey: "chats.byProject.collapsed") as? String ?? ""; if new_collapsedRaw != collapsedRaw { collapsedRaw = new_collapsedRaw }
+            let new_archivedRoomsRaw = d.object(forKey: "chats.archivedRooms") as? String ?? ""; if new_archivedRoomsRaw != archivedRoomsRaw { archivedRoomsRaw = new_archivedRoomsRaw }
+        }
         let new_botColorsRaw = d.object(forKey: BotColors.storageKey) as? String ?? ""; if new_botColorsRaw != botColorsRaw { botColorsRaw = new_botColorsRaw }
         let new_botAvatarsRaw = d.object(forKey: BotAvatarStore.storageKey) as? String ?? ""; if new_botAvatarsRaw != botAvatarsRaw { botAvatarsRaw = new_botAvatarsRaw }
         let new_glassAll = d.object(forKey: BotAvatarStore.glassAllKey) as? Bool ?? false; if new_glassAll != glassAll { glassAll = new_glassAll }

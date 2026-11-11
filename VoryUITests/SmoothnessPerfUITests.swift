@@ -5,7 +5,7 @@ import XCTest
 /// menu, a settings sheet, a long thread's scroll and a whole turn. Each flow is measured with
 /// XCTest's os_signpost hitch metrics (hitch time per second, the hitch count and the frame
 /// rate) over the app's `Smooth` animation intervals, or the system's navigation and scroll
-/// intervals. The numbers are the table for the planner; the simulator's are a rough guide,
+/// intervals. The numbers are the table for review; the simulator's are a rough guide,
 /// the device's are the bar. Skipped unless HERMES_E2E_URL / HERMES_E2E_TOKEN are set.
 final class SmoothnessPerfUITests: XCTestCase {
     private var app: XCUIApplication!
@@ -34,8 +34,8 @@ final class SmoothnessPerfUITests: XCTestCase {
         XCTOSSignpostMetric(subsystem: "Vory", category: "Smooth", name: name)
     }
 
-    /// Ten rounds for the quick flows (a single hitch in five rounds is noise; the planner wants
-    /// a mean and a worst that mean something), five for the long ones (a fling is 2.4 s each).
+    /// Ten rounds for the quick flows (a single hitch in five rounds is noise; a mean and a worst
+    /// should mean something), five for the long ones (a fling is 2.4 s each).
     private func rounds(_ n: Int) -> XCTMeasureOptions {
         let o = XCTMeasureOptions()
         o.iterationCount = n
@@ -253,8 +253,10 @@ final class SmoothnessPerfUITests: XCTestCase {
         let back = app.buttons["chat.back"].firstMatch, pill = app.buttons["chat.titlePill"].firstMatch, more = app.buttons["chat.more"].firstMatch
         print("BACK-FRAME landscape back \(back.frame) pill \(pill.frame) more \(more.frame) window \(app.windows.firstMatch.frame)")
         XCUIDevice.shared.orientation = .portrait; pause(2.5)
-        print("BACK-FRAME portrait back \(back.frame) hittable \(back.isHittable) pill \(pill.frame) more \(more.frame) window \(app.windows.firstMatch.frame)")
-        back.tap(); pause(1.5)
+        // No isHittable and no element tap on Back: XCTest can't compute its activation point here, and that failure
+        // ends the test, expected or not. A touch at its centre, as back() does.
+        print("BACK-FRAME portrait back \(back.frame) pill \(pill.frame) more \(more.frame) window \(app.windows.firstMatch.frame)")
+        back.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap(); pause(1.5)
         print("BACK-FRAME after-tap dock \(any("chat.dock").exists) profile.close \(app.buttons["profile.close"].firstMatch.exists) rows \(app.buttons.matching(NSPredicate(format: "label CONTAINS[c] 'Disk cleanup'")).count)")
         XCUIDevice.shared.orientation = .portrait
     }
@@ -738,11 +740,13 @@ final class SmoothnessPerfUITests: XCTestCase {
         func shot(_ name: String) { let a = XCTAttachment(screenshot: app.screenshot()); a.name = name; a.lifetime = .keepAlways; add(a) }
         let backs = app.descendants(matching: .any).matching(identifier: "chat.back").allElementsBoundByIndex
         var lines = ["chat.back count=\(backs.count)"]
-        for (i, b) in backs.enumerated() { lines.append("[\(i)] frame=\(b.frame) hittable=\(b.isHittable) type=\(b.elementType.rawValue) label=\(b.label)") }
+        // No isHittable and no element tap on Back: XCTest can't compute its activation point here, and that failure
+        // ends the test, expected or not. Its frames, then a touch at its centre.
+        for (i, b) in backs.enumerated() { lines.append("[\(i)] frame=\(b.frame) type=\(b.elementType.rawValue) label=\(b.label)") }
         lines.append("navBars=\(app.navigationBars.count)")
         let t = XCTAttachment(string: lines.joined(separator: "\n")); t.name = "back-diag"; t.lifetime = .keepAlways; add(t)
         shot("before-tap")
-        if let b = backs.first { b.tap() }
+        if let b = backs.first { b.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap() }
         pause(1.5)
         shot("after-tap")
         let dockStill = any("chat.dock").exists
@@ -1290,7 +1294,7 @@ final class SmoothnessPerfUITests: XCTestCase {
     }
 
     /// The keyboard dragged down over the thread (interactive dismiss), the drag slow enough for
-    /// the keyboard to track the finger (handoff item 2: 60 to 79 ms frames inside the tracking).
+    /// the keyboard to track the finger (frames of 60 to 79 ms were seen inside the tracking).
     func testKeyboardDrag() throws {
         guard let (url, token) = env else { throw XCTSkip("HERMES_E2E_URL / HERMES_E2E_TOKEN not set") }
         launch(url: url, token: token)

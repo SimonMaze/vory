@@ -7,6 +7,16 @@ import OSLog
 @Observable
 public final class GatewayRuntime {
     public let connection: GatewayConnection
+    /// How this runtime reaches its gateway: the network, or in process for the demo.
+    public let transport: GatewayTransport
+    /// The demo (#392): nothing it does is saved or synced. The one check every persistence path asks: the demo
+    /// connection, or any runtime on the in-process demo transport (onboarding's tour makes one of its own, #388).
+    public var isEphemeral: Bool { connection.isDemo || transport.isInProcess }
+    /// Where this runtime keeps files for the moment (staged attachments, downloads, fetched pictures): the system's
+    /// temporary folder, or for the demo a folder of its own that `stop()` removes, so leaving the demo leaves no file.
+    public let scratchDirectory: URL
+    /// Pictures and files fetched for the chats: the shared cache, or for the demo one in `scratchDirectory`.
+    public let media: MediaStore
     /// The address in use: the gateway's own, or for a gateway with a backup address (#283) the
     /// one that answered when the socket last connected.
     public private(set) var address: GatewayURL
@@ -31,7 +41,11 @@ public final class GatewayRuntime {
     /// their text without being redrawn, and are drawn once when it comes back.
     public var isAway = false {
         didSet {
-            if isAway, !oldValue { awaySince = Date() }
+            if isAway, !oldValue {
+                awaySince = Date()
+                // Away, the chats' re-attach tries and clock stop (#641).
+                for chat in registry.all { chat.wentAwayForReattach() }
+            }
             guard oldValue, !isAway else { return }
             // Away long enough for the network under the REST session to have changed (#423): its connections are
             // made afresh before anything is asked of them.
@@ -39,6 +53,8 @@ public final class GatewayRuntime {
                 Task { [api] in await api.resetSession() }
             }
             awaySince = nil
+            // Suspension can miss sessions.changed even without a socket-state change.
+            owedListRefresh = true
             // The chats' views catch up once, when the app says (`scheduleCatchUp`); they stay
             // held until then, so a live change meanwhile does not have them catch up early.
             for chat in registry.all { chat.beginCatchUp() }
@@ -48,8 +64,11 @@ public final class GatewayRuntime {
             }
             if let scheduleCatchUp { scheduleCatchUp(catchUp) } else { catchUp() }
             // A socket that died quietly while the app was away is found out now, not at the
-            // next heartbeat (see `GatewaySocket.checkAlive`).
-            Task { [socket] in await socket?.checkAlive() }
+            // next heartbeat (see `GatewaySocket.checkAlive`). One between attempts tries now (#641).
+            Task { [socket] in await socket?.checkAlive(); await socket?.retryNow() }
+            // A chat still not attached counts its trouble from now, and is tried at once (#641).
+            for chat in registry.all { chat.cameBackForReattach() }
+            reattachChats(all: false)
             // What was owed while away, once, after the return's animation (the foreground
             // transition is where the watchdog counts the main thread's seconds).
             owedFlush?.cancel()
@@ -113,6 +132,10 @@ public final class GatewayRuntime {
     var registry = ChatRegistry<ChatSession>()
     /// Every open chat, in the order it was opened.
     public var chats: [ChatSession] { registry.all }
+    /// This gateway answered `session.undo` with "unknown method": a Hermes without it, where a sent message can't be
+    /// taken back, so a bubble offers Copy to message instead of Edit & resend (#556). Learnt from that answer, never
+    /// guessed from a version.
+    public var undoUnsupported = false
     private var globalEventTask: Task<Void, Never>?
     /// Platform hooks, set by the app that owns this runtime.
     public var pushRegistrar: (any PushRegistrationSyncing)?
@@ -132,16 +155,27 @@ public final class GatewayRuntime {
     /// Speech in and out, by the Speech setting: the gateway's providers or this device's engines.
     public let voice = VoiceEngine()
 
-    public init(connection: GatewayConnection, store: ConnectionStore) {
+    public init(connection: GatewayConnection, store: ConnectionStore, transport: GatewayTransport = .network) {
         self.connection = connection
+        self.transport = transport
         self.store = store
+        let ephemeral = connection.isDemo || transport.isInProcess
+        if ephemeral {
+            let scratch = FileManager.default.temporaryDirectory.appendingPathComponent("vory-demo-" + UUID().uuidString, isDirectory: true)
+            scratchDirectory = scratch
+            media = MediaStore(directory: scratch.appendingPathComponent("media", isDirectory: true))
+        } else {
+            scratchDirectory = FileManager.default.temporaryDirectory
+            media = .shared
+        }
         let loadedSecrets = store.secrets(for: connection.id)
         self.secrets = loadedSecrets
         self.selectedProfile = connection.lastProfile
         let addresses = connection.addresses
         let first = AddressMemory().lastGood(for: connection.id).flatMap { addresses.indices.contains($0) ? addresses[$0] : nil } ?? connection.gateway
         self.address = first
-        self.api = HermesAPI(gateway: first, signer: RequestSigner(authMode: connection.authMode, secrets: loadedSecrets))
+        self.api = HermesAPI(gateway: first, signer: RequestSigner(authMode: connection.authMode, secrets: loadedSecrets), urlSession: transport.makeHTTPSession(), makeSession: { [transport] in transport.makeHTTPSession() },
+                              downloadDirectory: ephemeral ? scratchDirectory : nil)
         self.socket = GatewaySocket(
             urlProvider: { [weak self] in
                 guard let self else { throw SocketError.cancelled }
@@ -154,6 +188,8 @@ public final class GatewayRuntime {
                 let wasOpen = self.socketState.isOpen
                 self.socketState = s
                 if !wasOpen, s.isOpen { self.rememberAddress() }
+                // The chats lost their live attach with it: each waits for the socket (#641).
+                if wasOpen, !s.isOpen { for chat in self.registry.all { chat.socketWent() } }
                 // The status widget shows whether the gateway is reachable: tell it on every flip.
                 // Where HTTP counts too (the watch), a socket that closed asks HTTP afresh rather
                 // than keep the last answer.
@@ -164,7 +200,8 @@ public final class GatewayRuntime {
                 return await self.answer(serverRequest: req)
             },
             onReconnected: { [weak self] in await self?.didReconnect() },
-            onFirstConnected: { [weak self] in await self?.didConnectFirst() })
+            onFirstConnected: { [weak self] in await self?.didConnectFirst() },
+            makePipe: { [transport] in transport.makeFramePipe($0, nil) })
         // An attempt that got no answer from the ticket's REST call twice in a row, or a network change while
         // waiting: the REST session's connections are made afresh, as quitting the app did (#423).
         Task { [socket, api] in await socket?.setTroubleHandler { _ in await api.resetSession() } }
@@ -315,11 +352,12 @@ public final class GatewayRuntime {
         }
     }
 
-    /// With two addresses, a change of network while connected is checked at once: the address
-    /// in use may be out of reach from the new network, and the heartbeat could take half a
-    /// minute to notice. A socket that does not answer reconnects, and the reconnect chooses.
+    /// A change of network: the socket's wait between attempts ends and the chats not attached are tried (#641). With two
+    /// addresses it's also checked at once while connected: the address in use may be out of reach from the new network,
+    /// and the heartbeat could take half a minute to notice. A socket that does not answer reconnects, and the reconnect
+    /// chooses.
     private func watchNetwork() {
-        guard connection.alternate != nil, pathWatch == nil else { return }
+        guard pathWatch == nil else { return }
         pathWatch = Task { [weak self] in
             for await _ in NetworkWatch.shared.pathChanges() {
                 guard let self, !Task.isCancelled else { return }
@@ -328,10 +366,12 @@ public final class GatewayRuntime {
         }
     }
 
-    /// The network changed: a socket that does not answer within 3 s is dropped, and its
-    /// reconnect chooses the address again.
+    /// The network changed: with two addresses, a socket that does not answer within 3 s is dropped, and its reconnect
+    /// chooses the address again. A socket between attempts tries now, and the chats not attached are tried (#641).
     func networkChanged() async {
-        if socketState.isOpen { await socket.checkAlive(timeout: 3) }
+        if connection.alternate != nil, socketState.isOpen { await socket.checkAlive(timeout: 3) }
+        await socket.retryNow()
+        reattachChats(all: false)
     }
 
     // MARK: Lifecycle
@@ -356,6 +396,9 @@ public final class GatewayRuntime {
         globalEventTask?.cancel()
         kanban.stopEvents()
         await socket.disconnect()
+        transport.stop()
+        // The demo's files for the moment go with it.
+        if isEphemeral { try? FileManager.default.removeItem(at: scratchDirectory) }
     }
 
     public func reconnectNow() async {
@@ -385,10 +428,44 @@ public final class GatewayRuntime {
         await advertiseCapabilities()
         // The bots, if the first load went out before the route was up (#305).
         if profiles.isEmpty { lastError = nil; await loadProfiles() }
-        for chat in registry.all {
-            if !attachIfFailed(chat) { await chat.reattachAfterReconnect() }
-        }
+        reattachChats(all: true)
         await probeCodeSkew()
+    }
+
+    /// The chats off screen being re-attached, one at a time; whether a trigger came meanwhile, and whether any of those
+    /// was a reconnect (the strongest pending trigger is the one the rerun keeps).
+    private var offScreenReattach: Task<Void, Never>?
+    private var offScreenAgain = false
+    private var offScreenAgainAll = false
+
+    /// A trigger for the chats' re-attach (#641): a reconnect (`all`: every chat, as a reconnect always re-attached them),
+    /// or coming to the front and a network change (the chats not attached). The chats on screen start their schedule
+    /// now; the others re-attach once each, one at a time, after them, with no timer: at most one off-screen resume is in
+    /// flight, and a trigger while they go runs them once more after.
+    func reattachChats(all: Bool) {
+        for chat in registry.all where chat.isOnScreen {
+            if all { if !attachIfFailed(chat) { chat.reattachNow() } } else if chat.needsReattach { chat.reattachNow() }
+        }
+        if offScreenReattach != nil {
+            offScreenAgain = true
+            offScreenAgainAll = offScreenAgainAll || all
+            return
+        }
+        offScreenReattach = Task { [weak self] in
+            var everyChat = all
+            while let self {
+                self.offScreenAgain = false
+                self.offScreenAgainAll = false
+                for chat in self.registry.all where !chat.isOnScreen {
+                    if everyChat { if !self.attachIfFailed(chat) { await chat.reattachAfterReconnect() } }
+                    else if chat.needsReattach { await chat.reattachAfterReconnect() }
+                }
+                guard self.offScreenAgain else { break }
+                // A reconnect while the pass ran reaches every chat again (a chat whose open failed included).
+                everyChat = self.offScreenAgainAll
+            }
+            self?.offScreenReattach = nil
+        }
     }
 
     /// The socket's first open: there is nothing to re-attach, except a chat opened before it
@@ -427,9 +504,16 @@ public final class GatewayRuntime {
     /// with another one; empty follows the gateway's own active profile.
     public static let defaultProfileKey = "bots.defaultProfile"
     public var defaultProfile: String? {
-        let d = UserDefaults.standard.string(forKey: Self.defaultProfileKey) ?? ""
+        let d = defaultProfileChoice
         return d.isEmpty || !profiles.contains(where: { $0.name == d }) ? nil : d
     }
+    /// The default bot as Settings shows it ("": follow the gateway). The demo's is its own, for its life only (#494):
+    /// the setting is the person's, kept and synced, and a demo bot chosen there stayed after leaving the demo.
+    public var defaultProfileChoice: String {
+        get { isEphemeral ? ephemeralDefaultProfile : (UserDefaults.standard.string(forKey: Self.defaultProfileKey) ?? "") }
+        set { if isEphemeral { ephemeralDefaultProfile = newValue } else { UserDefaults.standard.set(newValue, forKey: Self.defaultProfileKey) } }
+    }
+    private var ephemeralDefaultProfile = ""
     /// Back to the default bot, when one is chosen and the selection drifted (a chat opened from
     /// another bot's list, a route from a notification).
     public func returnToDefaultProfile() {
@@ -611,7 +695,8 @@ public final class GatewayRuntime {
 
     public func closeChat(_ chat: ChatSession) {
         registry.remove(chat)
-        Task { _ = try? await socket.call("session.close", params: Self.params(["session_id": .string(chat.runtimeID)], owner: chat.profile)) }
+        // A detach on Hermes's session authority, session.close on the old wire (#666).
+        Task { await chat.close() }
     }
 
     // MARK: Events
@@ -630,6 +715,8 @@ public final class GatewayRuntime {
     nonisolated static let signposter = OSSignposter(subsystem: "Vory", category: .pointsOfInterest)
 
     private func handle(event: GatewayEvent) {
+        // Each ready says which wire this socket speaks; a reconnect may reach another gateway.
+        if event.type == "gateway.ready" { sessionAuthority = event.payload["session_authority"]?.boolValue == true }
         if let chat = registry.byRuntime(event.sessionID) {
             chat.handle(event: event)
             return
@@ -656,6 +743,10 @@ public final class GatewayRuntime {
     /// connected, and the last one: the diagnostics page shows them, so "I cannot see approvals"
     /// can be told apart as "none arrive" versus "they arrive and are not drawn".
     public private(set) var serverRequestsReceived = 0
+    /// True when the socket is served by Hermes's session authority (gateway.ready's `session_authority`; Hermes
+    /// v0.23.0 on a dashboard the gateway hosts): approvals and single questions come as `approval.request` and
+    /// `clarify.request` events and are answered with `approval.respond` and `clarify.respond` (#665).
+    public internal(set) var sessionAuthority = false
     public private(set) var lastServerRequest: String?
 
     private func answer(serverRequest req: ServerRequest) async -> JSONValue? {
@@ -718,6 +809,8 @@ public final class GatewayRuntime {
                                       needsAttention: needsAttention.count, chats: chats, contextPercent: ctx,
                                       connected: socketState.isOpen || (httpCountsAsOnline && lastListAnswered), usage: kept)
             snap.throughRelay = throughRelay ? true : nil
+            // The demo's chats stay in the app: not in the widgets' stored data, nor on the Watch.
+            guard !isEphemeral else { return }
             snap.save()
             onSnapshotPublished?(snap)
         }

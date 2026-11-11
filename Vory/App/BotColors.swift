@@ -44,8 +44,11 @@ enum BotColors {
         BotLooksMirror.mirror()
     }
 
-    static func hex(for profile: String, overrides: [String: String]? = nil) -> String {
-        if let h = (overrides ?? stored())[profile], !h.isEmpty { return h }
+    /// A bot's colour on a gateway (#573: the gateway in use unless one is named): its own, else the one from before,
+    /// else the palette's by its name. An empty one is "the default", and doesn't fall back.
+    static func hex(for profile: String, overrides: [String: String]? = nil, gateway: UUID? = BotLookGateway.current) -> String {
+        if let h = DemoLooks.color(for: profile) { return h }
+        if let h = BotLookGateway.value(in: overrides ?? stored(), for: profile, gateway: gateway), !h.isEmpty { return h }
         return defaultHex(for: profile)
     }
 
@@ -56,9 +59,34 @@ enum BotColors {
         Color(hex: hex(for: profile, overrides: overrides)) ?? .accentColor
     }
 
-    @MainActor static func set(_ color: Color, for profile: String) {
+    @MainActor static func set(_ color: Color, for profile: String) { set(hex: color.hexString, for: profile) }
+
+    /// A colour picked for a bot (the look editor's colour row too): the gateway in use's own (#573); the demo's, in
+    /// memory, while it runs.
+    @MainActor static func set(hex: String, for profile: String) {
+        if DemoLooks.keep(color: hex, for: profile) { return }
         var map = stored()
-        map[profile] = color.hexString
+        map[BotLookGateway.key(profile)] = hex
+        save(map)
+    }
+
+    /// "Reset to default": the gateway in use's own colour goes (#573). Where the bot has a colour from before, which other
+    /// gateways may show, an empty one of its own stands in, so that one neither changes nor shows here. In the demo, the
+    /// demo bot's own colour comes back.
+    @MainActor static func reset(for profile: String) {
+        if DemoLooks.keep(color: DemoBots.all.first { $0.name == profile }?.hex ?? defaultHex(for: profile), for: profile) { return }
+        var map = stored()
+        let own = BotLookGateway.key(profile)
+        map[own] = own != profile && map[profile] != nil ? "" : nil
+        save(map)
+    }
+
+    /// A new bot's colour, picked under its draft name in the new-bot sheet, goes to its name on the gateway in use.
+    @MainActor static func moveDraft(from draft: String, to name: String) {
+        var map = stored()
+        let from = BotLookGateway.key(draft), to = BotLookGateway.key(name)
+        if let c = map[from] { map[to] = c }
+        map[from] = nil
         save(map)
     }
 }
@@ -103,10 +131,17 @@ struct BotAvatar: View {
     private var effectiveMood: BotFaceView.Mood {
         var m = mood; if m.profile == nil { m.profile = profile }; return m
     }
+    /// The looks of the chat this face is in, where it has its own (`BotLookScope`: the tour's demo over a gateway in use).
+    @Environment(\.botLookScope) private var lookScope
     private var choice: BotAvatarChoice {
         if let override { return override }
+        if let scoped = lookScope?.avatar(for: profile) { return BotAvatarChoice(raw: BotAvatarStore.effective(scoped, glassAll: glassAll)) }
+        // The demo's bots wear the demo's looks while it runs (`DemoLooks`), as `BotAvatarStore.choice` has them: read
+        // from the stored map here, a live face (working, large, drawn, or just tapped) took the stored body in the
+        // demo's colour, and a bot changed shape as it started work.
+        if let demo = DemoLooks.avatar(for: profile) { return BotAvatarChoice(raw: BotAvatarStore.effective(demo, glassAll: glassAll)) }
         let m = BotLookMaps.map(avatarsRaw)
-        return BotAvatarChoice(raw: BotAvatarStore.effective(m[profile] ?? "", glassAll: glassAll))
+        return BotAvatarChoice(raw: BotAvatarStore.effective(BotLookGateway.value(in: m, for: profile) ?? "", glassAll: glassAll))
     }
 
     @Environment(\.colorScheme) private var colorScheme
@@ -145,9 +180,17 @@ struct BotAvatar: View {
     }
 
     var body: some View {
-        let hex = BotColors.hex(for: profile, overrides: overrides)
+        let hex = lookScope?.color(for: profile) ?? BotColors.hex(for: profile, overrides: overrides)
         Group {
-            if choice == .photo, let image = BotAvatarStore.photo(for: profile) {
+            if let scope = lookScope, scope.avatar(for: profile) != nil {
+                // A scoped look (the tour's demo): drawn from its own spec, never the stored look's memoised picture.
+                if restsAsImage {
+                    Image(uiImage: BotAvatarImage.cached(spec: choice.spec(hex: hex), size: size, scheme: colorScheme, closed: eyesShut, keep: true))
+                        .resizable().frame(width: size, height: size)
+                } else {
+                    BotFaceView(spec: choice.spec(hex: hex), size: size, active: active, drawn: drawn, mood: effectiveMood)
+                }
+            } else if choice == .photo, let image = BotAvatarStore.photo(for: profile) {
                 Image(uiImage: image).resizable().scaledToFill().frame(width: size, height: size).clipShape(Circle())
             } else if restsAsImage {
                 Image(uiImage: BotAvatarImage.cached(profile: profile, size: size, scheme: colorScheme, closed: eyesShut))
@@ -183,6 +226,48 @@ struct BotAvatar: View {
     }
 }
 
+/// The top bar's bot circle (Chats' profile menu): the bot's cached picture, exactly as before at rest. It blinks only
+/// as a foldable phone opens (Duo stage 4, `BotAmbient.opened`), by swapping to its eyes-shut twin for 120 ms, as a list
+/// row's still does, under the same gates; it has no blinks of its own.
+struct BarFaceCircle: View {
+    let profile: String
+    let size: CGFloat
+    let scheme: ColorScheme
+    @State private var shut = false
+    #if DEBUG
+    /// Which circle this is in the blink probe's lines: more than one can be on screen as the bar settles.
+    @State private var probeID = "bar-" + UUID().uuidString.prefix(6)
+    #endif
+
+    var body: some View {
+        Image(uiImage: BotAvatarImage.cached(profile: profile, size: size, scheme: scheme, closed: shut)).renderingMode(.original)
+            #if os(iOS)
+            #if DEBUG
+            .onAppear { BotAmbient.blinkLog("FACEUP still face \(probeID) front true on true") }
+            .onDisappear { BotAmbient.blinkLog("FACEDOWN still face \(probeID)") }
+            #endif
+            .onChange(of: BotAmbient.shared.opened) { _, d in
+                #if DEBUG
+                let skip: String? = d == nil ? "nil"
+                    : Date().timeIntervalSince(d!) >= BotMotionModel.Reaction.blinkLength ? String(format: "late %.3f", Date().timeIntervalSince(d!))
+                    : !BotMotionModel.Reaction.plays ? "plays" : UIAccessibility.isReduceMotionEnabled ? "reduceMotion" : BotAmbient.shared.scrolling ? "scrolling" : nil
+                if let skip { BotAmbient.blinkLog("FACESKIP still face \(probeID) \(skip)") }
+                #endif
+                guard let d, Date().timeIntervalSince(d) < BotMotionModel.Reaction.blinkLength, BotMotionModel.Reaction.plays,
+                      !UIAccessibility.isReduceMotionEnabled, !BotAmbient.shared.scrolling else { return }
+                Task {
+                    shut = true
+                    #if DEBUG
+                    BotAmbient.blinkLog("FACEBLINK still face \(probeID)")
+                    #endif
+                    try? await Task.sleep(for: .milliseconds(120))
+                    shut = false
+                }
+            }
+            #endif
+    }
+}
+
 /// A fixed look's face at rest, not a bot's own (the Companion card's Vory bot): a cached
 /// picture that blinks by swapping to its eyes-shut twin, as a list row's face does. The live
 /// glass face redrew the whole Settings page on every frame at rest (18% CPU on the simulator).
@@ -213,6 +298,10 @@ private struct StillBlink: ViewModifier {
     let key: String
     let on: Bool
     @Environment(\.botsLive) private var pageLive
+    #if DEBUG
+    /// Which face this is in the blink probe's lines (`-vory-blink-probe`): each one must blink once per opening.
+    @State private var probeID = UUID().uuidString.prefix(8)
+    #endif
     static var reduceMotionOn: Bool {
         #if os(iOS)
         UIAccessibility.isReduceMotionEnabled
@@ -235,39 +324,103 @@ private struct StillBlink: ViewModifier {
                 shut = false
             }
         }
+        #if os(iOS)
+        #if DEBUG
+        // For the hinge legs: a face is there to blink (FACEUP), with whether its page is in front and its blink is on;
+        // its page coming forward or going back (FACEFRONT), and the face going (FACEDOWN).
+        .onAppear { BotAmbient.blinkLog("FACEUP still face \(probeID) front \(pageLive) on \(on)") }
+        .onChange(of: pageLive) { _, f in BotAmbient.blinkLog("FACEFRONT still face \(probeID) \(f)") }
+        .onDisappear { BotAmbient.blinkLog("FACEDOWN still face \(probeID)") }
+        #endif
+        // A foldable phone opened (Duo stage 4): one blink by picture, as the live faces blink, on the page in front
+        // only, never with the bots still, under Reduce Motion or while the list is moving.
+        .onChange(of: BotAmbient.shared.opened) { _, d in
+            #if DEBUG
+            // Why a face didn't blink, the first gate that stopped it (the hinge legs).
+            let skip: String? = !on ? "on" : !pageLive ? "live" : d == nil ? "nil"
+                : Date().timeIntervalSince(d!) >= BotMotionModel.Reaction.blinkLength ? String(format: "late %.3f", Date().timeIntervalSince(d!))
+                : !BotMotionModel.Reaction.plays ? "plays" : Self.reduceMotionOn ? "reduceMotion" : BotAmbient.shared.scrolling ? "scrolling" : nil
+            if let skip { BotAmbient.blinkLog("FACESKIP still face \(probeID) \(skip)") }
+            #endif
+            guard on, pageLive, let d, Date().timeIntervalSince(d) < BotMotionModel.Reaction.blinkLength, BotMotionModel.Reaction.plays,
+                  !Self.reduceMotionOn, !BotAmbient.shared.scrolling else { return }
+            Task {
+                shut = true
+                #if DEBUG
+                BotAmbient.blinkLog("FACEBLINK still face \(probeID)")
+                #endif
+                try? await Task.sleep(for: .milliseconds(120))
+                shut = false
+            }
+        }
+        #endif
     }
 }
 
 /// Copies the bot colours, avatar choices and photo thumbnails into the shared keychain
-/// (`BotLooks`) for the notification extensions.
+/// (`BotLooks`) for the notification extensions. Never while the demo runs (#494): its looks come first while it does,
+/// and its bots' names would go to the extensions and the Watch; leaving it copies the person's own again.
 @MainActor
 enum BotLooksMirror {
     static func mirror() {
-        // The all-bots glass setting is baked in here, for every profile the gateway knows, so
-        // the extensions (which only read this mirror) draw the same bot as the app.
-        var avatars = BotAvatarStore.stored()
-        var colors = BotColors.stored()
-        let profiles = AppModel.shared.runtime?.profiles ?? []
-        let known = Set(avatars.keys).union(profiles.map(\.name))
-        for profile in known {
-            avatars[profile] = BotAvatarStore.effective(avatars[profile] ?? "")
-            if colors[profile] == nil { colors[profile] = BotColors.hex(for: profile) }
-        }
-        var photos: [String: Data] = [:]
-        for (profile, choice) in avatars where choice == "photo" {
-            if let image = BotAvatarStore.photo(for: profile), let data = thumbnail(image) { photos[profile] = data }
-        }
-        // The push names a bot by its profile name; a companion that only knows the label still
-        // finds it, so every look is stored under both.
-        for p in profiles where p.label != p.name && !p.label.isEmpty {
-            avatars[p.label] = avatars[p.name]; colors[p.label] = colors[p.name]; photos[p.label] = photos[p.name]
-        }
-        BotLooks(colors: colors, avatars: avatars, photos: photos).save()
+        guard !DemoLooks.isOn else { owedAfterDemo = true; return }
+        build().save()
         #if os(iOS)
         WatchSync.shared.refresh()
         #endif
         // A look changed (a photo replaced leaves no setting behind to notice): iCloud gets it.
         CloudSync.shared.looksChanged()
+    }
+
+    /// The copy itself, as `mirror` saves it.
+    static func build() -> BotLooks {
+        let rawAvatars = BotAvatarStore.stored(), rawColors = BotColors.stored()
+        let current = BotLookGateway.current
+        let profiles = AppModel.shared.runtime?.profiles ?? []
+        // The looks a gateway's bots wear (#573): its own where it has them, else the ones from before, for every name
+        // the maps know (and, for the gateway in use, every profile it has). The all-bots glass setting is baked in, so
+        // the extensions (which only read this copy) draw the same bot as the app.
+        func looks(for gateway: UUID?) -> BotLooks.Gateway {
+            var names = Set((Array(rawAvatars.keys) + Array(rawColors.keys)).compactMap { key -> String? in
+                guard let own = BotLookGateway.split(key) else { return key }
+                return own.gateway == gateway ? own.name : nil
+            })
+            if gateway == current { names.formUnion(profiles.map(\.name)) }
+            var avatars: [String: String] = [:], colors: [String: String] = [:], photos: [String: Data] = [:]
+            for name in names {
+                avatars[name] = BotAvatarStore.effective(BotLookGateway.value(in: rawAvatars, for: name, gateway: gateway) ?? "")
+                colors[name] = BotColors.hex(for: name, overrides: rawColors, gateway: gateway)
+                if avatars[name] == "photo", let image = BotAvatarStore.photo(forKey: BotLookGateway.readKey(in: rawAvatars, for: name, gateway: gateway)),
+                   let data = thumbnail(image) { photos[name] = data }
+            }
+            // The push names a bot by its profile name; a companion that only knows the label still finds it, so
+            // every look of the gateway in use is stored under both.
+            if gateway == current {
+                for p in profiles where p.label != p.name && !p.label.isEmpty {
+                    avatars[p.label] = avatars[p.name]; colors[p.label] = colors[p.name]; photos[p.label] = photos[p.name]
+                }
+            }
+            return BotLooks.Gateway(colors: colors, avatars: avatars, photos: photos)
+        }
+        // The top level is the gateway in use's, as before; each gateway with looks of its own, and the ones from before,
+        // go beside it, for a push from a gateway that isn't in use (it names its connection).
+        let inUse = looks(for: current)
+        var gateways: [String: BotLooks.Gateway] = [:]
+        let ids = Set((Array(rawAvatars.keys) + Array(rawColors.keys)).compactMap { BotLookGateway.split($0)?.gateway })
+        for id in ids.union(current.map { [$0] } ?? []) { gateways[id.uuidString] = id == current ? inUse : looks(for: id) }
+        return BotLooks(colors: inUse.colors, avatars: inUse.avatars, photos: inUse.photos, gateways: gateways, shared: looks(for: nil))
+    }
+
+    /// A copy asked for while the demo ran, and so not made (#494): made when the demo ends (`mirrorIfOwed`).
+    private static var owedAfterDemo = false
+
+    /// After the demo, the copy asked for while it ran, if any. A demo that changed none of the person's looks writes
+    /// nothing as it ends: the copy written on every leave was a first write of their default looks (the copy at launch
+    /// holds stored looks only), which #487's replay check saw as a change the demo made.
+    static func mirrorIfOwed() {
+        guard owedAfterDemo else { return }
+        owedAfterDemo = false
+        mirror()
     }
 
     private static func thumbnail(_ image: UIImage) -> Data? {
@@ -283,7 +436,7 @@ enum BotLooksMirror {
 
 /// Tells BotAmbient that the page it sits in has landed: its controller's viewDidAppear, after the
 /// push or the sheet has finished, so a waiting arrival (`BotAmbient.markArrival`) plays in full on
-/// a still page (judgement call #16). Nothing waits on a pop back or a sheet shown again.
+/// a still page. Nothing waits on a pop back or a sheet shown again.
 struct ArrivalProbe: View {
     let profile: String
     var body: some View { Probe(profile: profile).frame(width: 0, height: 0).accessibilityHidden(true) }

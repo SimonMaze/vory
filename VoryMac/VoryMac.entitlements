@@ -11,9 +11,7 @@
 	<!-- NativeAuth's OAuth callback listens on a loopback port. -->
 	<key>com.apple.security.network.server</key>
 	<true/>
-	<!-- Attachments: photos, voice memos, dictation. -->
-	<key>com.apple.security.device.camera</key>
-	<true/>
+	<!-- Voice memos, dictation and voice mode. -->
 	<key>com.apple.security.device.audio-input</key>
 	<true/>
 	<!-- Files chosen in open/save panels and dropped into the composer. -->
@@ -28,6 +26,10 @@
 	<string>development</string>
 	<!-- Notifications from a bot are presented as messages from it (its avatar as the icon). -->
 	<key>com.apple.developer.usernotifications.communication</key>
+	<true/>
+	<!-- Approvals and questions are time-sensitive notifications: they can break through a Focus and the
+	     notification summary, unless the person turns that off for Vory. -->
+	<key>com.apple.developer.usernotifications.time-sensitive</key>
 	<true/>
 	<!-- Same group as iOS: the notification service extension reads the gateways and bot looks. -->
 	<key>keychain-access-groups</key>

@@ -81,6 +81,61 @@ public struct SessionLiveInfo: Codable, Hashable, Sendable {
     }
 }
 
+extension Usage {
+    /// The counters Hermes's `session.stats` answers (v0.23.0, its session authority's way to read a chat's usage), as
+    /// its own status bar shows them (gateway/session_usage.py `tui_usage`): the context figures only when the last
+    /// prompt and the context length are both known, the cache hit only with a prompt and a cache read, and its
+    /// rounding (half to even) (#666).
+    public init(stats s: JSONValue) {
+        func int(_ key: String) -> Int? { s[key]?.intValue }
+        func nonzero(_ key: String) -> Int? { int(key).flatMap { $0 == 0 ? nil : $0 } }
+        func percent(_ part: Int, _ whole: Int) -> Int { max(0, min(100, Int((Double(part) / Double(whole) * 100).rounded(.toNearestOrEven)))) }
+        self.init(model: s["model"]?.stringValue ?? "", input: nonzero("input_tokens") ?? int("prompt_tokens") ?? 0,
+                  output: nonzero("output_tokens") ?? int("completion_tokens") ?? 0, reasoning: int("reasoning_tokens") ?? 0,
+                  total: int("total_tokens") ?? 0, calls: int("api_calls") ?? 0)
+        let used = int("last_prompt_tokens") ?? 0, maximum = int("context_length") ?? 0
+        let source = s["context_source"]?.stringValue
+        if used > 0, maximum > 0 {
+            let u = min(used, maximum)
+            contextUsed = u
+            contextMax = maximum
+            contextPercent = percent(u, maximum)
+            contextEstimated = (source ?? "provider_usage") != "provider_usage"
+        }
+        if source != nil { compressions = int("compression_count") ?? 0 }
+        let prompt = int("prompt_tokens") ?? 0, read = int("cache_read_tokens") ?? 0
+        if prompt > 0, read > 0 { cacheHitPct = percent(read, prompt) }
+        if let tps = s["tokens_per_s"]?.doubleValue { avgTps = (tps * 10).rounded(.toNearestOrEven) / 10 }
+        if let n = int("active_subagents") { activeSubagents = n }
+    }
+}
+
+extension SessionLiveInfo {
+    /// `new` over `old`, field by field: what `new` says replaces, what it doesn't say stays. Hermes's session
+    /// authority publishes `session.info` in parts (a claim's running state, a service tier), never the whole (#666).
+    public static func merging(_ old: SessionLiveInfo?, _ new: SessionLiveInfo) -> SessionLiveInfo {
+        guard var m = old else { return new }
+        m.model = new.model ?? m.model
+        m.provider = new.provider ?? m.provider
+        m.reasoningEffort = new.reasoningEffort ?? m.reasoningEffort
+        m.serviceTier = new.serviceTier ?? m.serviceTier
+        m.fast = new.fast ?? m.fast
+        m.yolo = new.yolo ?? m.yolo
+        m.approvalMode = new.approvalMode ?? m.approvalMode
+        m.cwd = new.cwd ?? m.cwd
+        m.branch = new.branch ?? m.branch
+        m.running = new.running ?? m.running
+        m.title = new.title ?? m.title
+        m.storedSessionId = new.storedSessionId ?? m.storedSessionId
+        m.version = new.version ?? m.version
+        m.usage = new.usage ?? m.usage
+        m.profileName = new.profileName ?? m.profileName
+        m.credentialWarning = new.credentialWarning ?? m.credentialWarning
+        m.lazy = new.lazy ?? m.lazy
+        return m
+    }
+}
+
 public struct TranscriptMessage: Codable, Hashable, Sendable {
     public var role: String
     public var text: String?
@@ -97,9 +152,23 @@ public struct TranscriptMessage: Codable, Hashable, Sendable {
     public var finishReason: String?
     /// Whether the row asked for tools: its reasoning is thinking before a tool call, never an answer.
     public var hasToolCalls: Bool
+    /// An asking row's calls, every one in order: the stored row names a tool only here, so its
+    /// result rows are named by matching (`TranscriptItem.fromHistory`).
+    public var toolCalls: [ToolCallRef]
+    /// A tool result row: the call it answers, and the tool's name when the row was stored with it.
+    public var toolCallID: String?
+    public var toolName: String?
+
+    /// One call on an asking row.
+    public struct ToolCallRef: Codable, Hashable, Sendable {
+        public var id: String?
+        public var name: String
+        public init(id: String?, name: String) { self.id = id; self.name = name }
+    }
 
     public init(role: String, text: String? = nil, timestamp: Double? = nil, rowId: Int? = nil, displayKind: String? = nil, name: String? = nil, context: String? = nil, reasoning: String? = nil,
-                apiContent: String? = nil, finishReason: String? = nil, hasToolCalls: Bool = false) {
+                apiContent: String? = nil, finishReason: String? = nil, hasToolCalls: Bool = false,
+                toolCalls: [ToolCallRef] = [], toolCallID: String? = nil, toolName: String? = nil) {
         self.role = role
         self.text = text
         self.timestamp = timestamp
@@ -110,7 +179,10 @@ public struct TranscriptMessage: Codable, Hashable, Sendable {
         self.reasoning = reasoning
         self.apiContent = apiContent
         self.finishReason = finishReason
-        self.hasToolCalls = hasToolCalls
+        self.hasToolCalls = hasToolCalls || !toolCalls.isEmpty
+        self.toolCalls = toolCalls
+        self.toolCallID = toolCallID
+        self.toolName = toolName
     }
 
     // The WebSocket `session.resume` history is pre-flattened (`text`), but the REST
@@ -119,8 +191,9 @@ public struct TranscriptMessage: Codable, Hashable, Sendable {
     // The watch and the fast-open prefetch read that page, so both shapes decode here.
     private enum Keys: String, CodingKey {
         case role, text, timestamp, rowId, displayKind, name, context, reasoning, content, id, toolCalls, displayContent
-        case apiContent, finishReason, reasoningContent, hasToolCalls
+        case apiContent, finishReason, reasoningContent, hasToolCalls, toolCallID, toolName
         case rowIdRaw = "row_id", displayKindRaw = "display_kind", toolCallsRaw = "tool_calls", displayContentRaw = "display_content"
+        case toolCallIDRaw = "tool_call_id", toolCallIdCamel = "toolCallId", toolNameRaw = "tool_name"
         case apiContentRaw = "api_content", finishReasonRaw = "finish_reason", reasoningContentRaw = "reasoning_content"
     }
 
@@ -136,9 +209,17 @@ public struct TranscriptMessage: Codable, Hashable, Sendable {
         rowId = (try? c.decodeIfPresent(Int.self, forKey: .rowId)) ?? (try? c.decodeIfPresent(Int.self, forKey: .rowIdRaw)) ?? (try? c.decodeIfPresent(Int.self, forKey: .id))
         displayKind = (try? c.decodeIfPresent(String.self, forKey: .displayKind)) ?? (try? c.decodeIfPresent(String.self, forKey: .displayKindRaw))
         let calls = (try? c.decodeIfPresent(JSONValue.self, forKey: .toolCalls)) ?? (try? c.decodeIfPresent(JSONValue.self, forKey: .toolCallsRaw))
+        // Every call, not only the first: a row that asked for three tools named one of them and
+        // its other results read "tool" (#387). The cache's own spelling is a list of refs.
+        toolCalls = calls?.arrayValue?.compactMap { call -> ToolCallRef? in
+            guard let n = call["function"]?["name"]?.stringValue ?? call["name"]?.stringValue, !n.isEmpty else { return nil }
+            return ToolCallRef(id: call["id"]?.stringValue ?? call["call_id"]?.stringValue, name: n)
+        } ?? []
         var n = try? c.decodeIfPresent(String.self, forKey: .name)
-        if n == nil, let first = calls?.arrayValue?.first { n = first["function"]?["name"]?.stringValue ?? first["name"]?.stringValue }
+        if n == nil { n = toolCalls.first?.name }
         name = n
+        toolCallID = (try? c.decodeIfPresent(String.self, forKey: .toolCallID)) ?? (try? c.decodeIfPresent(String.self, forKey: .toolCallIDRaw)) ?? (try? c.decodeIfPresent(String.self, forKey: .toolCallIdCamel))
+        toolName = (try? c.decodeIfPresent(String.self, forKey: .toolName)) ?? (try? c.decodeIfPresent(String.self, forKey: .toolNameRaw))
         context = try? c.decodeIfPresent(String.self, forKey: .context)
         // Both spellings: `JSONValue.decode` converts snake_case, the transcript cache does not.
         // Blank is absent: the gateway pads reasoning_content with a single space for some APIs.
@@ -165,6 +246,9 @@ public struct TranscriptMessage: Codable, Hashable, Sendable {
         try c.encodeIfPresent(apiContent, forKey: .apiContent)
         try c.encodeIfPresent(finishReason, forKey: .finishReason)
         if hasToolCalls { try c.encode(true, forKey: .hasToolCalls) }
+        if !toolCalls.isEmpty { try c.encode(toolCalls, forKey: .toolCalls) }
+        try c.encodeIfPresent(toolCallID, forKey: .toolCallID)
+        try c.encodeIfPresent(toolName, forKey: .toolName)
     }
 
     /// OpenAI-style content: a string, or parts like `{type: "text", text: …}`.
@@ -219,7 +303,9 @@ public struct StoredSession: Codable, Hashable, Identifiable, Sendable {
         let t = (title ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         if !t.isEmpty { return t }
         let p = (preview ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-        return p.isEmpty ? "New chat" : String(p.prefix(80))
+        if !p.isEmpty { return String(p.prefix(80)) }
+        // A scheduled task's run with neither (#673) is said as what wrote it: "New chat" is the person's own new one.
+        return source == "cron" ? "Scheduled task" : "New chat"
     }
     public var lastDate: Date? { (lastActive ?? startedAt).map { Date(timeIntervalSince1970: $0) } }
 

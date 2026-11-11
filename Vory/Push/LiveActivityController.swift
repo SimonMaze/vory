@@ -327,6 +327,16 @@ final class LiveActivityController: TurnActivityReporting {
         }
     }
 
+    /// Ends every card a gateway's chats have up: leaving the demo (#392) leaves none of its turns on the Lock Screen, nor
+    /// does a launch after the app ended inside it (#632). Returns how many it ended.
+    @discardableResult
+    static func endAll(connection: UUID) -> Int {
+        let all = Activity<HermesTurnAttributes>.activities
+        let ids = Set(DemoLeftovers.cards(all.map { (id: $0.id, connection: $0.attributes.connectionID) }, of: connection.uuidString))
+        for a in all where ids.contains(a.id) { endNow(a) }
+        return ids.count
+    }
+
     private static func endNow(_ a: Activity<HermesTurnAttributes>) {
         var st = a.content.state
         st.endedAtUnix = st.endedAtUnix ?? Date().timeIntervalSince1970
@@ -404,7 +414,9 @@ final class LiveActivityController: TurnActivityReporting {
                                                        startedAt: startedAt, contextUsed: chat.usage?.contextUsed, contextMax: chat.usage?.contextMax)
         state.voiceMode = voiceLine
         do {
-            let a = try Activity.request(attributes: attributes, content: .init(state: state, staleDate: Date().addingTimeInterval(3600)), pushType: .token)
+            let a = try Activity.request(attributes: attributes, content: .init(state: state, staleDate: Date().addingTimeInterval(3600)),
+                                     // The demo's (#392) is updated from the app alone: no push token, which the system fetches from Apple.
+                                     pushType: chat.runtime.isEphemeral ? nil : .token)
             let h = ActivityHandle(a)
             handle = h
             lastAsk = nil
@@ -428,8 +440,9 @@ final class LiveActivityController: TurnActivityReporting {
         // companion's push when one is installed; only without it does the app raise its own.
         if attention, !alertedAttention, UIApplication.shared.applicationState != .active, !LocalNotifier.companionDelivers {
             alertedAttention = true
-            let botName = handle.activity.attributes.botName ?? chat.profileName
-            handle.alert(state, title: botName, body: state.attentionKind == "input" ? "Your input is needed — tap to answer. It waits for you." : "Approval needed — tap to answer. It waits for you.")
+            // A push-started activity's names arrive sealed and empty (#497): the chat's own bot name, then.
+            let botName = handle.activity.attributes.botName.flatMap { $0.isEmpty ? nil : $0 } ?? chat.profileName
+            handle.alert(state, title: botName, body: state.attentionKind == "input" ? "Your input is needed. Tap to answer. It waits for you." : "Approval needed. Tap to answer. It waits for you.")
             Self.note("approval alert from the app (background)")
             return
         }

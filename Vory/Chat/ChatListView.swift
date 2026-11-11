@@ -33,6 +33,23 @@ struct ChatRoute: Hashable, Codable {
 struct ChatListView: View {
     @Environment(AppModel.self) private var model
     @Environment(\.windowGeometry) private var windowGeometry
+    /// The status stands in a top corner: the top bar's row gets its room there, and the search keeps the bar (`TopBarRoom`).
+    @Environment(\.statusInCorner) private var statusInCorner
+    /// The top bar up in the status band (the open Duo upright): the bar kept while searching there too (#516).
+    @Environment(\.barLift) private var barLift
+    #if os(iOS)
+    /// The closed Duo (#591, 2026-11-02): no search drawer, the system's search button in the side column instead,
+    /// and the row's room kept by the list, never by the stack. The stack's room moved the chat's Back and More down the
+    /// strip (#590, #586), and as a pop brought the list in it came late (the field dropped from under the row) or
+    /// collapsed the drawer.
+    private var closedStrip: Bool { TopBarRoom.closedStrip(barsVertical: model.tabBarVertical, size: windowGeometry.bounds.size) }
+    /// The row's room under the top bar (#340), worked out as the stack's always was. On the closed Duo the list keeps it
+    /// itself, over its first row.
+    private var rowRoom: CGFloat {
+        TopBarRoom.inset(barsVertical: model.tabBarVertical, statusInCorner: statusInCorner, barOn: MorphTopBar.active(model),
+                         rowBottom: MorphState.shared.rootRowBottom)
+    }
+    #endif
     /// The Mac keeps this page mounted behind the others (`macPageShown`, MainSplitView).
     @Environment(\.macPageShown) private var pageShown
     /// The Mac's split view hands in the detail column's path: chats open there, beside the list,
@@ -137,15 +154,17 @@ struct ChatListView: View {
     #if os(macOS)
     /// The list as shown, for stepping through it from the keyboard.
     private func entries(_ runtime: GatewayRuntime) -> [ListEntry] {
-        let rows = filtered(searchText.isEmpty ? sessions : searchResults, runtime: runtime)
+        let (rows, scheduled) = parts(filtered(searchText.isEmpty ? sessions : searchResults, runtime: runtime))
+        // The scheduled chats first, as drawn, while their section is open (#673).
+        let runs = prefs.scheduledOpen ? scheduled.map(ListEntry.session) : []
         let visibleRooms = prefs.groupsOnly
             ? rooms.filter { (prefs.showArchived || !archivedRooms.contains($0.roomId)) && (searchText.isEmpty || $0.name.localizedCaseInsensitiveContains(searchText)) }
             : []
         if grouped(runtime) {
             // Top to bottom as drawn: each open project's visible chats, then the group chats.
-            return groups(rows, runtime: runtime).flatMap { g in collapsed.contains(g.id) ? [] : shown(g).map(ListEntry.session) } + visibleRooms.map(ListEntry.room)
+            return runs + groups(rows, runtime: runtime).flatMap { g in collapsed.contains(g.id) ? [] : shown(g).map(ListEntry.session) } + visibleRooms.map(ListEntry.room)
         }
-        return Self.merge(rows, visibleRooms, sort: prefs.sortKey)
+        return runs + Self.merge(rows, visibleRooms, sort: prefs.sortKey)
     }
 
     /// Opens the chat `direction` rows away from the open one (the first when none is open).
@@ -190,7 +209,7 @@ struct ChatListView: View {
             NavigationStack(path: path) {
                 content
                     .navigationDestination(for: ChatRoute.self) { route in ConversationView(route: route).countsChatOnScreen() }
-                    .navigationDestination(for: RoomRoute.self) { r in RoomView(room: r.room, initialText: r.initialText).countsChatOnScreen(room: true) }
+                    .navigationDestination(for: RoomRoute.self) { r in RoomView(room: r.room, initialText: r.initialText).countsChatOnScreen(room: true).closedChatsRoom() }
             }
         }
     }
@@ -211,7 +230,16 @@ struct ChatListView: View {
             // pull-to-refresh (Bots does both), so the pinned custom field it replaced, from
             // before this iOS, is gone; the field no longer rides in and out with the bar on the
             // way back from a chat.
-            .searchable(text: $searchText, placement: .navigationBarDrawer(displayMode: .automatic), prompt: "Search chats")
+            // On the closed Duo, behind the system's search button instead (`closedStrip`).
+            .searchable(text: $searchText, placement: closedStrip ? .toolbar : .navigationBarDrawer(displayMode: .automatic), prompt: "Search chats")
+            .searchToolbarBehavior(closedStrip ? .minimize : .automatic)
+            // Its toolbar integration kept right at the navigation item as the window enters or leaves the closed strip
+            // (`ChatsSearchPlacement`).
+            // The bar kept while searching under a status in a top corner, with the bar up in the band (#516), and wherever
+            // the floating bar stands over the system's band (a standard iPhone too, #648), as on the other pages.
+            .searchPresentationToolbarBehavior(TopBarRoom.keepsBarWhileSearching(statusInCorner: statusInCorner, barUp: barLift > 0,
+                floatingBar: TopBarRoom.floatingBarOverBand(barOn: MorphTopBar.active(model), barsVertical: model.tabBarVertical,
+                                                            size: windowGeometry.bounds.size)) ? .avoidHidingContent : .automatic)
             .textInputAutocapitalization(.never).autocorrectionDisabled()
             #endif
             // One column on a window wider than a phone (the open Duo upright, 669 pt): the
@@ -235,6 +263,10 @@ struct ChatListView: View {
             // An empty bar collapses (the Duo's search drawer rode up under the capsules): an
             // invisible item keeps it at its height under the prototype.
             .toolbar { if MorphTopBar.active(model) { ToolbarItem(placement: .principal) { Color.clear.frame(width: 1, height: 44).accessibilityHidden(true) } } }
+            // Where the search drawer rode up under the bar's capsules (#340), the stack starts under its row; on the closed
+            // Duo, with no drawer, the list keeps that room itself (`closedStrip`) and the stack has none.
+            .background(TopBarRoomProbe(tab: .chats, room: closedStrip ? 0 : rowRoom).frame(width: 0, height: 0))
+            .background(ChatsSearchPlacement(closedStrip: closedStrip).frame(width: 0, height: 0))
             #endif
             .background(InteractivePopEnabler())
             // The stack's path is watched by whoever owns it (ChatsSplitPage for the model's
@@ -277,7 +309,7 @@ struct ChatListView: View {
                 ToolbarItem(placement: .topBarLeading) { if !MorphTopBar.active(model) { profileMenu } }
                 ToolbarItemGroup(placement: .topBarTrailing) {
                     if !MorphTopBar.active(model) {
-                    Button { showNewBot = true } label: { Image(systemName: "plus") }.accessibilityLabel("New bot")
+                    if !model.isInDemo { Button { showNewBot = true } label: { Image(systemName: "plus") }.accessibilityLabel("New bot") }
                     // One View menu (sort + filters) wherever the list is a split view's column
                     // or shares a strip with the system's items: three buttons beside the title
                     // truncated "Chats" in a 380 pt column, and worse in the open Duo's portrait.
@@ -308,7 +340,8 @@ struct ChatListView: View {
                 guard let r else { return }
                 model.chatListRequest = nil
                 switch r.kind {
-                case .newBot: showNewBot = true
+                // No New bot in the demo (#494): its look editor wrote the person's own bot's look.
+                case .newBot: showNewBot = !model.isInDemo
                 case .manageProjects: showProjects = true
                 case .selectChats: withAnimation(selectMotion) { selecting = true }
                 // Select's controls in the morph bar (#408).
@@ -364,7 +397,9 @@ struct ChatListView: View {
             #endif
             .task(id: runtime?.connection.id) { await load() }
             .task(id: runtime?.selectedProfile) { await load() }
-            .task(id: prefs.allBots) { await load() }
+            // All bots, and Archived shown or hidden: the list asks for archived chats only while they're shown
+            // (`listQuery`). One task for both: another modifier put this chain past the type checker.
+            .task(id: "\(prefs.allBots)-\(prefs.showArchived)") { await load() }
             // The bots arriving (an empty list too) or changing, a rename included: All bots lists
             // each one's chats.
             .onChange(of: loadedBotNames) { _, _ in Task { await load() } }
@@ -450,7 +485,7 @@ struct ChatListView: View {
             // A rendered, untinted image: live glass went murky on the toolbar's glass and a
             // painted view picked up the toolbar's tint in light mode.
             // Memoised: drawn afresh on every pass it flashed while the bar re-laid out (a pull).
-            Image(uiImage: BotAvatarImage.cached(profile: model.listChipProfile ?? "?", size: 26, scheme: colorScheme)).renderingMode(.original)
+            BarFaceCircle(profile: model.listChipProfile ?? "?", size: 26, scheme: colorScheme)
                 .accessibilityLabel("Profile: \(model.listChipProfile ?? "none")")
         }
         .id("\(prefs.botColorsRaw)|\(prefs.botAvatarsRaw)|\(prefs.glassAll)|\(colorScheme == .light)")
@@ -540,7 +575,8 @@ struct ChatListView: View {
 
     /// The filters and the sort applied to the loaded (or searched) sessions.
     private func filtered(_ list: [StoredSession], runtime: GatewayRuntime) -> [StoredSession] {
-        var out = list
+        // A scheduled task's run with no messages is never listed, nor found (#673).
+        var out = list.filter(ScheduledChats.isListed)
         if prefs.pinnedOnly { out = out.filter { $0.pinned == true } }
         if prefs.needsYouOnly { out = out.filter { runtime.needsAttention.contains($0.id) } }
         if prefs.liveOnly { out = out.filter { runtime.chatForStored($0.id)?.isRunning ?? false } }
@@ -614,7 +650,9 @@ struct ChatListView: View {
     #endif
 
     @ViewBuilder private func list(_ runtime: GatewayRuntime) -> some View {
-        let rows = filtered(searchText.isEmpty ? sessions : searchResults, runtime: runtime)
+        let drawn = parts(filtered(searchText.isEmpty ? sessions : searchResults, runtime: runtime))
+        let rows = drawn.chats
+        let scheduled = drawn.scheduled
         #if DEBUG
         let _ = Perf.tick("chatlist-body")
         #endif
@@ -638,19 +676,27 @@ struct ChatListView: View {
             let visibleRooms = prefs.groupsOnly
                 ? rooms.filter { (prefs.showArchived || !archivedRooms.contains($0.roomId)) && (searchText.isEmpty || $0.name.localizedCaseInsensitiveContains(searchText)) }
                 : []
+            // The scheduled tasks' chats, above the person's own, in a section of their own (#673).
+            if !scheduled.isEmpty { scheduledSection(scheduled, runtime: runtime) }
             if grouped(runtime) {
                 groupedRows(rows, rooms: visibleRooms, runtime: runtime)
             } else {
                 let entries = Self.merge(rows, visibleRooms, sort: prefs.sortKey)
-                if entries.isEmpty && !loading {
+                if entries.isEmpty && scheduled.isEmpty && !loading {
                     if let waiting = model.needsSignIn {
                         ContentUnavailableView("Sign in to see your chats", systemImage: "person.badge.key",
                                                description: Text("\(waiting.name) has no sign-in on \(DeviceWords.this) yet."))
                             .listRowSeparator(.hidden)
+                            #if os(iOS)
+                            .listRowBackground(closedStrip ? Color.clear : nil)   // #693 (B2)
+                            #endif
                     } else {
                         ContentUnavailableView(searchText.isEmpty ? "No chats yet" : "No results", systemImage: "bubble.left.and.bubble.right",
                                                description: Text(searchText.isEmpty ? "Start a new chat with the compose button." : "Try another search."))
                             .listRowSeparator(.hidden)
+                            #if os(iOS)
+                            .listRowBackground(closedStrip ? Color.clear : nil)   // #693 (B2)
+                            #endif
                     }
                 }
                 ForEach(entries) { entry in
@@ -662,6 +708,12 @@ struct ChatListView: View {
             }
         }
         .listStyle(.insetGrouped)
+        #if os(iOS)
+        // #693 (B2): on the closed Duo the page is one surface, as the Bots page is, so the side column stands on one
+        // color from top to bottom. The rows' own backgrounds are cleared where the rows are made (the same tag).
+        .scrollContentBackground(closedStrip ? .hidden : .automatic)
+        .background(closedStrip ? Color(.systemBackground) : Color.clear)
+        #endif
         #if os(macOS)
         // The search field sits over the list it searches (in the top inset below), as in
         // Messages: in the window's toolbar it landed at the far end, over the open chat.
@@ -670,13 +722,28 @@ struct ChatListView: View {
         .onChange(of: model.chatStepRequest?.id) { _, _ in if let r = model.chatStepRequest { step(r.direction, runtime: runtime) } }
         #endif
         // Wider rows: the card hugs the screen edges and the rows their card.
+        #if os(iOS)
+        // On the closed Duo the trailing side keeps the list's own margin, so the rows end left of the side column as
+        // every other tab's rows do (#693). The leading side is as it was.
+        .contentMargins(.leading, ChatRowStyle.cardInset, for: .scrollContent)
+        .contentMargins(.trailing, closedStrip ? nil : ChatRowStyle.cardInset, for: .scrollContent)
+        #else
         .contentMargins(.horizontal, ChatRowStyle.cardInset, for: .scrollContent)
+        #endif
         #if os(iOS)
         // The tab bar's room at the list's end, its own and constant (it replaces the root's): the
         // root's drops to 0 while a chat is up, and a list scrolled to its end had its offset
         // clamped to the shorter content then, so after Back it sat that much lower, 59 pt, its
         // last row under the bar (Matt on 1.5 (11): the list "drops" after a swipe back).
         .contentMargins(.bottom, model.tabBarVertical ? 0 : VoryTabBar.reservedHeight(in: windowGeometry) + 16, for: .scrollContent)
+        // The closed Duo's room under the top bar's row, the list's own (#591): laid out with the list, so it's in place as a
+        // pop brings the list in, on a stack SwiftUI built anew at a fold too. The row's room alone, so the first row stands
+        // under the bar's row as a group chat's header and every other page do (#616: the search drawer's height, kept
+        // there once search moved into the side column, left an empty band over the rows). The list keeps clear of the
+        // page's own bar there as the chat does (its 24 pt band, and the 58 pt one an animated pop lays out over the coming
+        // page, which carried the list down for the pop and back up after it), so its top is that room alone.
+        .contentMargins(.top, closedStrip ? rowRoom : 0, for: .scrollContent)
+        .ignoresSafeArea(.container, edges: closedStrip ? .top : [])
         #endif
         #if os(macOS)
         // The list runs a little way under the column's edge, which cut the scroll bar in half
@@ -707,7 +774,9 @@ struct ChatListView: View {
         .animation(.snappy, value: runtime.restartRequired == nil)
         .animation(.snappy, value: model.needsSignIn == nil)
         .onChange(of: scrollToTop) { _, _ in
-            let first = Self.merge(rows, prefs.groupsOnly ? rooms : [], sort: prefs.sortKey).first?.id ?? rows.first?.id
+            // The Scheduled section's row when there is one: it stands above the first chat (#673).
+            let first = scheduled.isEmpty ? Self.merge(rows, prefs.groupsOnly ? rooms : [], sort: prefs.sortKey).first?.id ?? rows.first?.id
+                : ScheduledChats.rowID
             if let first { withAnimation(.snappy) { proxy.scrollTo(first, anchor: .top) } }
         }
         }
@@ -731,6 +800,53 @@ struct ChatListView: View {
                     .transition(.move(edge: .top).combined(with: .opacity))
             }
         }
+    }
+
+    // MARK: Scheduled (#673)
+
+    /// The rows as drawn: the person's chats, and the scheduled ones for their section. A search's results are one flat
+    /// list, as they are with projects.
+    private func parts(_ rows: [StoredSession]) -> (chats: [StoredSession], scheduled: [StoredSession]) {
+        searchText.isEmpty ? ScheduledChats.split(rows) : (rows, [])
+    }
+
+    /// The Scheduled section: its row, which opens and closes it, and its chats while it's open, in the list's order.
+    @ViewBuilder private func scheduledSection(_ runs: [StoredSession], runtime: GatewayRuntime) -> some View {
+        #if os(macOS)
+        // Open, its chats end in a band before the person's: the Mac's inset list draws no gap between sections and
+        // no line of its own at a section's end, as the iPhone's and iPad's groups do, so the person's chats ran
+        // straight on from them. The band is the list's own footer row: its content 16 pt of space with no words, its
+        // line running the list's full width. Closed, its row is the break, and there's no band. The rows are the
+        // iPhone's and iPad's, below.
+        Section {
+            ScheduledSectionRow(count: runs.count, open: prefs.scheduledOpen,
+                                working: runs.filter { runtime.chatForStored($0.id)?.isRunning ?? false }.count,
+                                waiting: runs.filter { runtime.needsAttention.contains($0.id) }.count,
+                                onToggle: { withAnimation(.snappy) { prefs.scheduledOpen.toggle() } })
+                .listRowInsets(EdgeInsets(top: 6, leading: ChatRowStyle.rowInset, bottom: 6, trailing: 8))
+                .id(ScheduledChats.rowID)
+            if prefs.scheduledOpen {
+                ForEach(runs, id: \.listRowID) { s in sessionRow(s, runtime: runtime) }
+            }
+        } footer: {
+            if prefs.scheduledOpen { Color.clear.frame(height: 16).accessibilityHidden(true) }
+        }
+        #else
+        Section {
+            ScheduledSectionRow(count: runs.count, open: prefs.scheduledOpen,
+                                working: runs.filter { runtime.chatForStored($0.id)?.isRunning ?? false }.count,
+                                waiting: runs.filter { runtime.needsAttention.contains($0.id) }.count,
+                                onToggle: { withAnimation(.snappy) { prefs.scheduledOpen.toggle() } })
+                .listRowInsets(EdgeInsets(top: 6, leading: ChatRowStyle.rowInset, bottom: 6, trailing: 8))
+                #if os(iOS)
+                .listRowBackground(closedStrip ? Color.clear : nil)   // #693 (B2)
+                #endif
+                .id(ScheduledChats.rowID)
+            if prefs.scheduledOpen {
+                ForEach(runs, id: \.listRowID) { s in sessionRow(s, runtime: runtime) }
+            }
+        }
+        #endif
     }
 
     // MARK: Grouped by project
@@ -840,6 +956,12 @@ struct ChatListView: View {
             actionFailure = ActionFailure(title: failed.count == 1 ? "Could not archive \u{201C}\(first.displayTitle)\u{201D}" : "Could not archive \(failed.count) chats",
                                           message: PinSupport.reason(error))
         }
+        // The chats archived marked so in the list before it's read again, as a row's own Archive does (`patch`): the
+        // gateway may leave them out of its list now (#474), and the list keeps a left-out chat's flags as they were.
+        let done = Set(list.filter { s in s.archived != true && !failed.contains { $0.0.id == s.id } }.map(\.id))
+        withAnimation(.snappy) {
+            for i in sessions.indices where done.contains(sessions[i].id) { sessions[i].archived = true; sessions[i].pinned = false }
+        }
         await load()
     }
 
@@ -882,6 +1004,19 @@ struct ChatListView: View {
     /// answered for its bots (an empty answer counts: such a gateway lists no chats).
     static func canList(allBots: Bool, botsLoaded: Bool) -> Bool { !allBots || botsLoaded }
 
+    /// The list's request: the most recent chats, a page of `limit`, with archived chats asked for only while the
+    /// Archived filter shows them (#474). A Hermes that leaves them out unless asked (`archived=exclude`, its default
+    /// since 1eda335a) sent none, so turning Archived on showed nothing; and with them hidden, they aren't asked for, so
+    /// the page's rows aren't spent on chats nobody sees. An older Hermes ignores the parameter and lists every chat;
+    /// the filter on the device (`filtered`) still hides the archived ones there. Without the scheduled tasks' chats,
+    /// which are asked for apart (`ScheduledChats.query`): on a gateway whose tasks run every few minutes, a page of 100
+    /// held only hours of their runs, and the person's own chats fell off it (#673).
+    nonisolated static func listQuery(limit: Int, showArchived: Bool) -> [URLQueryItem] {
+        [URLQueryItem(name: "order", value: "recent"), URLQueryItem(name: "limit", value: String(limit)),
+         URLQueryItem(name: "archived", value: showArchived ? "include" : "exclude"),
+         URLQueryItem(name: "exclude_sources", value: ScheduledChats.source)]
+    }
+
     private func load(attempt: Int = 0) async {
         guard let runtime else { return }
         let cacheProfile = prefs.allBots ? "*" : runtime.selectedProfile
@@ -905,6 +1040,7 @@ struct ChatListView: View {
             var all: [StoredSession] = []
             if prefs.allBots {
                 let profiles = runtime.profiles.map(\.name)
+                let showArchived = prefs.showArchived
                 // Each bot's rows in the bots' own order, whichever answered first: a chat the
                 // gateway lists under several bots kept whichever listing arrived first, so its
                 // bot and avatar flipped between loads (Matt, 2026-10-12: "the bots and chats
@@ -913,8 +1049,17 @@ struct ChatListView: View {
                 try await withThrowingTaskGroup(of: (String, [StoredSession]).self) { group in
                     for p in profiles {
                         group.addTask {
-                            let r: SessionListResponse = try await runtime.api.get("/api/sessions", query: [URLQueryItem(name: "order", value: "recent"), URLQueryItem(name: "limit", value: "50")], profile: p)
-                            return (p, r.sessions.map { var s = $0; if s.profile == nil || s.profile!.isEmpty { s.profile = p }; return s })
+                            // The bot's chats, and apart from them its scheduled chats with a reply (#673).
+                            let rows = try await ScheduledChats.fetch(
+                                chats: {
+                                    let r: SessionListResponse = try await runtime.api.get("/api/sessions", query: Self.listQuery(limit: 50, showArchived: showArchived), profile: p)
+                                    return r.sessions
+                                },
+                                scheduled: {
+                                    let r: SessionListResponse = try await runtime.api.get("/api/sessions", query: ScheduledChats.query(limit: ScheduledChats.limit, showArchived: showArchived), profile: p)
+                                    return r.sessions
+                                })
+                            return (p, rows.map { var s = $0; if s.profile == nil || s.profile!.isEmpty { s.profile = p }; return s })
                         }
                     }
                     for try await (p, part) in group { byProfile[p] = part }
@@ -928,8 +1073,18 @@ struct ChatListView: View {
                 // Each row carries the bot it was listed for: opening it later must not depend
                 // on which bot is selected by then.
                 let listed = runtime.selectedProfile
-                let r: SessionListResponse = try await runtime.api.get("/api/sessions", query: [URLQueryItem(name: "order", value: "recent"), URLQueryItem(name: "limit", value: "100")], profile: listed)
-                all = r.sessions.map { var s = $0; if s.profile == nil || s.profile!.isEmpty { s.profile = listed }; return s }
+                let showArchived = prefs.showArchived
+                // Its chats, and apart from them its scheduled chats with a reply (#673).
+                let rows = try await ScheduledChats.fetch(
+                    chats: {
+                        let r: SessionListResponse = try await runtime.api.get("/api/sessions", query: Self.listQuery(limit: 100, showArchived: showArchived), profile: listed)
+                        return r.sessions
+                    },
+                    scheduled: {
+                        let r: SessionListResponse = try await runtime.api.get("/api/sessions", query: ScheduledChats.query(limit: ScheduledChats.limit, showArchived: showArchived), profile: listed)
+                        return r.sessions
+                    })
+                all = rows.map { var s = $0; if s.profile == nil || s.profile!.isEmpty { s.profile = listed }; return s }
             }
             pinsKept = PinSupport.kept(rows: all, connection: runtime.connection.id)
             // Chats open in the app that the gateway does not list yet: a new chat gets its
@@ -941,6 +1096,10 @@ struct ChatListView: View {
             // pinned chat itself, so the only rows such a keep held were stale ones (a chat
             // compressed onto a new id, one deleted elsewhere), and those could never be
             // unpinned or archived again (the row was the app's own copy).
+            // Such a row keeps the pin and archive the list last had for it: a Hermes that lists archived chats only
+            // when asked (#474) leaves out a chat archived here on purpose, and added as unarchived it came straight
+            // back, unarchived, while Archived was hidden. Kept archived, the filter decides.
+            let before = Dictionary(sessions.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
             let now = Date().timeIntervalSince1970
             for chat in runtime.chats where !listed.contains(chat.storedID) && !chat.storedID.isEmpty
                 && (chat.isRunning || !chat.items.isEmpty)
@@ -950,13 +1109,14 @@ struct ChatListView: View {
                                          preview: chat.items.first.flatMap { if case .user(let t, _) = $0.kind { return t }; return nil },
                                          source: "ios", model: chat.modelName.isEmpty ? nil : chat.modelName,
                                          startedAt: chat.items.first?.timestamp.timeIntervalSince1970 ?? now, lastActive: max(last, now - 1),
-                                         messageCount: chat.items.count, isActive: chat.isRunning, archived: false, pinned: false, profile: chat.profileName))
+                                         messageCount: chat.items.count, isActive: chat.isRunning,
+                                         archived: before[chat.storedID]?.archived ?? false, pinned: before[chat.storedID]?.pinned ?? false,
+                                         profile: chat.profileName))
             }
             // A chat keeps its place until it has new messages: the gateway counts an attach as
             // activity, so the chat just read floated to the top on the way back and every row
             // shifted (Matt, 2026-10-12: "the chats list jumps ... we want it to remain the same
             // when going into a chat and out of"). Its old time stays until something was said.
-            let before = Dictionary(sessions.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
             all = all.map { s in
                 guard let p = before[s.id], p.messageCount == s.messageCount, let was = p.lastActive, (s.lastActive ?? 0) > was else { return s }
                 var kept = s; kept.lastActive = was; return kept
@@ -977,10 +1137,14 @@ struct ChatListView: View {
             withTransaction(tx) {
                 sessions = all.sorted { ($0.pinned ?? false ? 1 : 0, $0.lastActive ?? 0) > ($1.pinned ?? false ? 1 : 0, $1.lastActive ?? 0) }
             }
-            // What Siri can name without the app on screen: the bots and the recent chats' titles (#310).
-            SiriCatalog.rememberBots(runtime.profiles)
-            SiriCatalog.rememberChats(sessions)
-            SessionCache.save(sessions, connection: runtime.connection.id, profile: cacheProfile)
+            // What Siri can name without the app on screen: the bots and the recent chats' titles (#310); and the list
+            // for the next launch. Neither for the demo (#392): its bots and chats stay out of Siri, Spotlight and the cache.
+            if !runtime.isEphemeral {
+                SiriCatalog.rememberBots(runtime.profiles)
+                // Not the scheduled tasks' empty runs, which aren't listed (#673).
+                SiriCatalog.rememberChats(sessions.filter(ScheduledChats.isListed))
+                SessionCache.save(sessions, connection: runtime.connection.id, profile: cacheProfile)
+            }
             errorText = nil
             // Group chats live on the gateway's room driver; none when it has no rooms.
             if let r: GroupsListResult = try? await runtime.rpc("groups.list", ["limit": 50], timeout: 10).decode() {
@@ -1120,6 +1284,9 @@ struct ChatListView: View {
                         .task(id: "\(s.id)-\(s.lastActive ?? 0)-\(aiSummaries)") { if aiSummaries { summarizer.refresh(s, runtime: runtime, profile: prefs.allBots ? s.profile : nil) } }
                 }
                 .listRowInsets(EdgeInsets(top: 10, leading: ChatRowStyle.rowInset, bottom: 10, trailing: 8))
+                #if os(iOS)
+                .listRowBackground(closedStrip ? Color.clear : nil)   // #693 (B2)
+                #endif
                 .accessibilityFocused($spokenRow, equals: s.id)
                 #if os(macOS)
                 // A firm press on the trackpad peeks the conversation, as the long press does on the phone.
@@ -1191,6 +1358,9 @@ struct ChatListView: View {
                     }
                 }
                 .listRowInsets(EdgeInsets(top: 10, leading: ChatRowStyle.rowInset, bottom: 10, trailing: 8))
+                #if os(iOS)
+                .listRowBackground(closedStrip ? Color.clear : nil)   // #693 (B2)
+                #endif
                 .task(id: "\(room.roomId)-\(room.latestSeq ?? 0)-\(aiSummaries)") {
                     if roomLogs[room.roomId] == nil || (room.latestSeq ?? 0) > (roomLogs[room.roomId]?.last?.seq ?? 0),
                        let r: GroupsLogResult = try? await runtime.rpc("groups.log", ["room_id": .string(room.roomId), "since_seq": 0, "limit": 40], timeout: 10).decode() {
@@ -1280,7 +1450,9 @@ struct ChatListView: View {
         if case .bool(let v)? = body["archived"] { archived = v }
         if afterClose { heldRows[s.id] = was }
         // Fenced on a newer Hermes (#467): the chat's revision with the edit.
-        async let sent: Void = SessionMutation.patch(runtime.api, id: s.id, profile: s.profile ?? runtime.selectedProfile, fields: body)
+        let targetProfile = s.profile ?? runtime.selectedProfile
+        let api = runtime.api
+        async let sent: Void = SessionMutation.patch(api, id: s.id, profile: targetProfile, fields: body)
         if afterClose { try? await Task.sleep(for: Self.closeBeforeMove) }
         // Shown now, by the row's id (a reload in the wait may have reordered the list); the
         // gateway's answer decides whether it stays that way.
@@ -1334,6 +1506,7 @@ enum PinSupport {
 
     static func refused(_ connection: UUID) -> Bool { (UserDefaults.standard.stringArray(forKey: key) ?? []).contains(connection.uuidString) }
     static func noteRefused(_ connection: UUID) {
+        guard connection != GatewayConnection.demoID else { return }
         var ids = Set(UserDefaults.standard.stringArray(forKey: key) ?? [])
         ids.insert(connection.uuidString)
         UserDefaults.standard.set(Array(ids), forKey: key)
@@ -1428,7 +1601,11 @@ struct SessionRow: View {
                 // While the bot works: what it is working on, over one line of the preview, so
                 // the row keeps its height.
                 if live { ChatGoalLine(storedID: session.id, step: step) }
-                Text(summary?.summary ?? session.preview ?? "").font(.subheadline).foregroundStyle(.secondary).lineLimit(live ? max(1, ChatRowStyle.previewLines - 1) : ChatRowStyle.previewLines)
+                // A scheduled task's chat with no preview has no empty line under its title: its row is as tall as its words.
+                let preview = summary?.summary ?? session.preview ?? ""
+                if !(preview.isEmpty && ScheduledChats.isScheduled(session)) {
+                    Text(preview).font(.subheadline).foregroundStyle(.secondary).lineLimit(live ? max(1, ChatRowStyle.previewLines - 1) : ChatRowStyle.previewLines)
+                }
                 HStack(spacing: 8) {
                     if let project { ProjectChip(project: project) }
                     if let m = session.model, !m.isEmpty { Text(m).font(.caption2).foregroundStyle(.tertiary).lineLimit(1) }
@@ -1652,7 +1829,7 @@ struct ChatListFilterItems: View {
         }
 }
 
-/// The bot picker, All bots, the connection and the gateway switch.
+/// The bot picker, All bots, the connection and the gateway switch. In the demo, the connection and Leave demo first.
 struct ChatListProfileItems: View {
     @Environment(AppModel.self) private var model
     @Environment(\.colorScheme) private var colorScheme
@@ -1660,6 +1837,19 @@ struct ChatListProfileItems: View {
     private var runtime: GatewayRuntime? { model.runtime }
     @ViewBuilder var body: some View {
             if let runtime {
+                // In the demo (#392), the way out is here too, not in Settings only: it leaves as Settings' Leave demo does.
+                // Its section comes first, so Leave demo is in reach at every text size (at the largest the menu scrolls,
+                // and as its last row it was out of sight).
+                if model.isInDemo {
+                    Section(sectionTitle(runtime)) {
+                        Label(runtime.socketState.label, systemImage: connectionSymbol(runtime.socketState))
+                        if case .open = runtime.socketState {} else {
+                            Button { Task { await runtime.reconnectNow() } } label: { Label("Reconnect", systemImage: "arrow.clockwise") }
+                        }
+                        Button { Task { await model.endDemo() } } label: { Label("Leave demo", systemImage: "rectangle.portrait.and.arrow.right") }
+                            .accessibilityIdentifier("chats.leaveDemo")
+                    }
+                }
                 Picker("Profile", selection: Binding(get: { runtime.selectedProfile ?? "" }, set: { runtime.selectedProfile = $0 })) {
                     ForEach(runtime.profiles) { p in
                         Label { Text(p.label) } icon: { Image(uiImage: BotAvatarImage.cached(profile: p.name, scheme: colorScheme)).renderingMode(.original) }.tag(p.name)
@@ -1667,14 +1857,15 @@ struct ChatListProfileItems: View {
                 }
                 Toggle(isOn: Bindable(prefs).allBots) { Label("All bots", systemImage: "person.2") }
                 #if os(macOS)
-                Button { model.chatListRequest = .init(.newBot) } label: { Label("New Bot…", systemImage: "plus") }
+                if !model.isInDemo { Button { model.chatListRequest = .init(.newBot) } label: { Label("New Bot…", systemImage: "plus") } }
                 #endif
-                Divider()
-                // With a backup address (#283), the address in use beside the gateway's name.
-                Section([runtime.connection.name, runtime.addressLabel].compactMap { $0 }.joined(separator: " · ")) {
-                    Label(runtime.socketState.label, systemImage: connectionSymbol(runtime.socketState))
-                    if case .open = runtime.socketState {} else {
-                        Button { Task { await runtime.reconnectNow() } } label: { Label("Reconnect", systemImage: "arrow.clockwise") }
+                if !model.isInDemo {
+                    Divider()
+                    Section(sectionTitle(runtime)) {
+                        Label(runtime.socketState.label, systemImage: connectionSymbol(runtime.socketState))
+                        if case .open = runtime.socketState {} else {
+                            Button { Task { await runtime.reconnectNow() } } label: { Label("Reconnect", systemImage: "arrow.clockwise") }
+                        }
                     }
                 }
                 // Two gateways (a main machine and a homelab, say): switch here instead of
@@ -1688,6 +1879,10 @@ struct ChatListProfileItems: View {
                 }
             }
             }
+    /// The connection's section title: with a backup address (#283), the address in use beside the gateway's name.
+    private func sectionTitle(_ runtime: GatewayRuntime) -> String {
+        [runtime.connection.name, runtime.addressLabel].compactMap { $0 }.joined(separator: " · ")
+    }
     private func connectionSymbol(_ s: SocketState) -> String {
         switch s {
         case .open: return "checkmark.circle.fill"
@@ -1715,3 +1910,36 @@ private struct ChatsSelectPublisher: ViewModifier {
             .onDisappear { model.chatsSelect = nil }
     }
 }
+
+#if os(iOS)
+/// The Chats list's search placement at the root's navigation item (#591). Off the closed strip, the drawer's (.stacked) with
+/// toolbar integration off: SwiftUI put .stacked back when the Duo opened from closed but left the flag on, and UIKit kept
+/// an iOS search bar at the screen's foot with no drawer until the flag changed. On the closed strip, the flag back on, as
+/// SwiftUI set it for the system's search button in the side column; the placement there is SwiftUI's own.
+struct ChatsSearchPlacement: UIViewControllerRepresentable {
+    var closedStrip: Bool
+    func makeUIViewController(context: Context) -> Setter { Setter() }
+    func updateUIViewController(_ setter: Setter, context: Context) {
+        setter.closedStrip = closedStrip
+        // After SwiftUI's own update of the item.
+        DispatchQueue.main.async { setter.apply() }
+    }
+
+    final class Setter: UIViewController {
+        var closedStrip = false
+        override func loadView() { let v = UIView(); v.isUserInteractionEnabled = false; v.backgroundColor = .clear; view = v }
+        override func viewWillAppear(_ animated: Bool) { super.viewWillAppear(animated); apply() }
+
+        func apply() {
+            guard let item = navigationController?.viewControllers.first?.navigationItem else { return }
+            // Only on a change, so an update that changes nothing sets nothing.
+            if closedStrip {
+                if !item.searchBarPlacementAllowsToolbarIntegration { item.searchBarPlacementAllowsToolbarIntegration = true }
+            } else {
+                if item.preferredSearchBarPlacement != .stacked { item.preferredSearchBarPlacement = .stacked }
+                if item.searchBarPlacementAllowsToolbarIntegration { item.searchBarPlacementAllowsToolbarIntegration = false }
+            }
+        }
+    }
+}
+#endif

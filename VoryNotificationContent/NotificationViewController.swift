@@ -17,7 +17,8 @@ final class NotificationViewController: UIViewController, UNNotificationContentE
         // this, so the extension still ran the 1.4 drawing with its turn).
         BotFace.motionEngine = true
         Keychain.accessGroup = Keychain.sharedGroupFromBundle()
-        let looks = BotLooks.load()
+        // The looks of the gateway the push comes from (#573), not only the one in use.
+        let looks = BotLooks.load().forGateway(hermes["connection_id"] as? String)
         let profile = hermes["profile"] as? String ?? ""
         let bot = content.title.isEmpty ? (profile.isEmpty ? "Hermes" : profile) : content.title
         let key = looks.key(profile: profile, label: bot.components(separatedBy: " · ").first ?? bot) ?? profile
@@ -25,7 +26,7 @@ final class NotificationViewController: UIViewController, UNNotificationContentE
             bot: bot,
             chatTitle: (hermes["title"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? content.subtitle,
             text: (hermes["text"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? Self.stripTitle(content.body),
-            tintHex: looks.colors[key] ?? "",
+            tintHex: looks.color(for: key, profile: profile),
             avatar: looks.avatars[key] ?? "initial",
             failed: content.categoryIdentifier == "HERMES_ERROR",
             when: notification.date)

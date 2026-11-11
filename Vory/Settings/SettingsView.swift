@@ -56,11 +56,15 @@ struct SettingsView: View {
     @AppStorage(BotAvatarStore.storageKey) private var botAvatarsRaw = ""
     @AppStorage(BotAvatarStore.glassAllKey) private var glassAll = false
     @Environment(\.colorScheme) private var colorScheme
+    /// The Profile picker's faces grow with the row's text: drawn at 24 pt at every size, they stayed small beside the
+    /// largest text (#526). 24 at the default size, so nothing changes there. Whole points, for the face cache.
+    @ScaledMetric(relativeTo: .body) private var pickerFace: CGFloat = 24
 
     var body: some View {
         NavigationStack {
             SettingsList {
-                if search.isEmpty, !setupCardDone, model.runtime != nil, model.push.registeredAt == nil {
+                // A gateway of the person's own only (#494): dismissed in the demo, it never showed for theirs.
+                if search.isEmpty, !setupCardDone, model.runtime.map({ !$0.isEphemeral }) == true, model.push.registeredAt == nil {
                     Section {
                         NavigationLink { CompanionView().pushedPage() } label: {
                             HStack(spacing: 12) {
@@ -88,7 +92,10 @@ struct SettingsView: View {
                             HStack(spacing: 12) {
                                 GatewayTile()
                                 VStack(alignment: .leading) {
-                                    Text(model.runtime?.connection.name ?? "No gateway").font(.headline)
+                                    HStack(spacing: 6) {
+                                        Text(model.runtime?.connection.name ?? "No gateway").font(.headline)
+                                        if model.isInDemo { DemoTag() }
+                                    }
                                     // The address in use: with a backup (#283), the one that answered.
                                     Text(model.runtime.map { rt in [rt.addressLabel, rt.address.description].compactMap { $0 }.joined(separator: " · ") } ?? "Add a gateway").font(.caption).foregroundStyle(.secondary).lineLimit(1)
                                 }
@@ -98,10 +105,24 @@ struct SettingsView: View {
                             .padding(.vertical, 4)
                         }
                         .accessibilityIdentifier("settings.row.gateways")
+                        // Demo mode (#392): the way out, and the way to a gateway of one's own; with a gateway saved, the
+                        // way in (it switches back with Leave demo).
+                        if model.isInDemo {
+                            Button { Task { await model.endDemo() } } label: { Label("Leave demo", systemImage: "rectangle.portrait.and.arrow.right") }
+                                .accessibilityIdentifier("settings.leaveDemo")
+                            NavigationLink { GatewayFormView(existing: nil).pushedPage(keepsOwnBar: true) } label: {
+                                Label("Connect your gateway", systemImage: "network")
+                            }
+                            .accessibilityIdentifier("settings.connectGateway")
+                        } else if !model.store.connections.isEmpty {
+                            Button { Task { await model.startDemo() } } label: { Label("Try the demo", systemImage: "sparkles") }
+                                .accessibilityHint("Opens Vory with demo bots. Leave demo in Settings brings your gateway back.")
+                                .accessibilityIdentifier("settings.tryDemo")
+                        }
                         if let rt = model.runtime, !rt.profiles.isEmpty {
                             Picker("Profile", selection: Binding(get: { rt.selectedProfile ?? "" }, set: { rt.selectedProfile = $0 })) {
                                 ForEach(rt.profiles) { p in
-                                    Label { Text(p.label) } icon: { Image(uiImage: BotAvatarImage.cached(profile: p.name, size: 24, scheme: colorScheme)).renderingMode(.original) }.tag(p.name)
+                                    Label { Text(p.label) } icon: { Image(uiImage: BotAvatarImage.cached(profile: p.name, size: pickerFace.rounded(), scheme: colorScheme)).renderingMode(.original) }.tag(p.name)
                                 }
                             }
                             // The menu's icons are rendered images; a new identity redraws them when a look changes.
@@ -186,7 +207,7 @@ struct GatewaysView: View {
     @Environment(AppModel.self) private var model
     @State private var showAdd = false
     @State private var pendingDelete: GatewayConnection?
-    /// The gateway whose form is open as a sheet: the Mac's way (judgement call #13).
+    /// The gateway whose form is open as a sheet: the Mac's way.
     @State private var editing: GatewayConnection?
 
     var body: some View {
@@ -212,7 +233,7 @@ struct GatewaysView: View {
                         Spacer()
                         #if os(macOS)
                         // The Mac opens the form as a sheet, as the sidebar's gateway does: pushed,
-                        // its toolbar Back stood beside the form's own Cancel (judgement call #13).
+                        // its toolbar Back stood beside the form's own Cancel.
                         Button { editing = c } label: { Image(systemName: "chevron.right").font(.footnote.weight(.semibold)).foregroundStyle(.tertiary) }
                             .buttonStyle(.plain).frame(width: 20)
                             .accessibilityLabel("Edit \(c.name)").accessibilityIdentifier("gateways.edit")
@@ -249,7 +270,7 @@ struct GatewaysView: View {
                 }
             }
             Section {
-                Button { Smooth.animate("gatewaySheet"); showAdd = true } label: { Label("Add Gateway", systemImage: "plus") }
+                Button { addGateway() } label: { Label("Add Gateway", systemImage: "plus") }
                     .accessibilityIdentifier("settings.addGateway")
                 if let rt = model.runtime {
                     Button { Task { await rt.reconnectNow() } } label: { Label("Reconnect", systemImage: "arrow.clockwise") }
@@ -261,6 +282,10 @@ struct GatewaysView: View {
             }
         }
         .untitledPage()
+        // Add gateway at the top as on every page that can make something (#428): the bar draws it beside its Back where the
+        // morph bar is up; the page's own toolbar has it elsewhere. The row in the list stays.
+        .pageToolbar { ToolbarItem(placement: .primaryAction) { if !MorphTopBar.active(model) { Button { addGateway() } label: { Label("Add gateway", systemImage: "plus") }.accessibilityIdentifier("gateways.add") } } }
+        .morphPageActions([MorphPageAction(id: "gateways.add", symbol: "plus", label: "Add gateway") { addGateway() }], on: MorphTopBar.active(model))
         .sheet(isPresented: $showAdd) { NavigationStack { GatewayFormView() }.sheetFrame().withAppModel() }
         #if os(macOS)
         .sheet(item: $editing) { c in GatewayFormSheet(existing: c).withAppModel() }
@@ -270,6 +295,8 @@ struct GatewaysView: View {
             Button("Cancel", role: .cancel) {}
         } message: { Text("Saved credentials for this gateway are deleted from the Keychain.") }
     }
+
+    private func addGateway() { Smooth.animate("gatewaySheet"); showAdd = true }
 }
 
 // MARK: Profile
@@ -286,6 +313,9 @@ struct ProfileView: View {
     var body: some View {
         SettingsList {
             SettingsHeaderSection(title: "Profile", symbol: "person.crop.circle", color: .indigo, description: "Which bot the Settings screens read and write, and new bots on this gateway.")
+            // In the demo no bot is made or removed here (#392): the demo keeps neither, and the list read the old one
+            // back. Choosing which bot the Settings screens show stays: that is the app's own.
+            DemoReadOnlyNote()
             if let rt = model.runtime {
                 Section("Active profile in this app") {
                     ForEach(rt.profiles) { p in
@@ -301,26 +331,32 @@ struct ProfileView: View {
                             }
                         }
                         .tint(.primary)
+                        .accessibilityIdentifier("profile.row")
                         .swipeActions(edge: .trailing, allowsFullSwipe: false) {
                             // The default profile is the gateway's own home; Hermes refuses to delete it.
-                            if p.isDefault != true, p.name != "default" {
+                            if p.isDefault != true, p.name != "default", !model.isInDemo {
                                 Button(role: .destructive) { pendingDelete = p } label: { Label("Delete", systemImage: "trash") }
                             }
                         }
                         .contextMenu {
-                            if p.isDefault != true, p.name != "default" {
+                            if p.isDefault != true, p.name != "default", !model.isInDemo {
                                 Button(role: .destructive) { pendingDelete = p } label: { Label("Delete profile…", systemImage: "trash") }
                             }
                         }
                     }
                 }
                 Section {
-                    Button { showCreate = true } label: { Label("Create Profile", systemImage: "plus") }
+                    if !model.isInDemo { Button { showCreate = true } label: { Label("Create Profile", systemImage: "plus") } }
                     if let error { Text(error).foregroundStyle(.red).font(.footnote) }
                 } footer: { Text("Profiles are separate Hermes homes on the gateway machine (config, skills, sessions). Settings screens read and write the profile selected here.") }
             }
         }
         .reloadable { await model.runtime?.loadProfiles() }
+        // Add profile at the top as on every page that can make something (#428), with a gateway to make it on: the bar
+        // draws it beside its Back where the morph bar is up; the page's own toolbar has it elsewhere. The row stays.
+        .pageToolbar { ToolbarItem(placement: .primaryAction) { if !MorphTopBar.active(model), model.runtime != nil, !model.isInDemo { Button { showCreate = true } label: { Label("Add profile", systemImage: "plus") }.accessibilityIdentifier("profile.add") } } }
+        .morphPageActions(model.isInDemo ? [] : [MorphPageAction(id: "profile.add", symbol: "plus", label: "Add profile") { showCreate = true }],
+                          on: MorphTopBar.active(model) && model.runtime != nil)
         .alert("Delete \(pendingDelete?.label ?? "profile")?", isPresented: Binding(get: { pendingDelete != nil }, set: { if !$0 { pendingDelete = nil } })) {
             Button(deleting ? "Deleting…" : "Delete", role: .destructive) { if let p = pendingDelete { Task { await delete(p) } } }.disabled(deleting)
             Button("Cancel", role: .cancel) { pendingDelete = nil }
@@ -376,16 +412,19 @@ struct NotificationsView: View {
         SettingsList {
             SettingsHeaderSection(title: "Notifications", symbol: "bell.badge", color: .red, description: "Permission\(!DeviceWords.isMac ? ", Live Activities and haptics" : "") on \(DeviceWords.this).")
             Section {
-                Toggle("Notifications", isOn: $notificationsOn)
+                // In the demo (#392) it reads off and can't be turned: it registers with the person's own gateway and the
+                // relay, and the demo has neither (its notifications are the app's own, on this device).
+                Toggle("Notifications", isOn: model.isInDemo ? .constant(false) : $notificationsOn)
+                    .disabled(model.isInDemo)
                     .onChange(of: notificationsOn) { _, on in
-                        Task {
-                            guard let rt = model.runtime else { return }
-                            if on { await push.registerWithRelay(); await push.syncRegistration(runtime: rt) }
-                            else { await push.removeRegistration(runtime: rt) }
-                        }
+                        Task { await push.notificationsTurned(on: on, runtime: model.runtime) }
                     }
             } footer: {
-                Text(notificationsOn ? "\(DeviceWords.this.capitalized) is registered with the gateway for approvals, questions, finished turns and errors while Vory is closed." : "Off: \(DeviceWords.this) is removed from the gateway's device list, so the Companion sends it nothing. Turn it on to register again.")
+                if model.isInDemo {
+                    Text("The demo's notifications come from the demo itself, on \(DeviceWords.this). This switch is for your own gateway, once you leave the demo.")
+                } else {
+                    Text(notificationsOn ? "\(DeviceWords.this.capitalized) is registered with the gateway for approvals, questions, finished turns and errors while Vory is closed." : "Off: \(DeviceWords.this) is removed from the gateway's device list, so the Companion sends it nothing. Turn it on to register again.")
+                }
             }
             #if os(iOS)
             Section {
@@ -458,7 +497,7 @@ struct SecurityView: View {
                 }
                 .onChange(of: confirmMode) { _, _ in LocalNotifier.registerCategories() }
             } header: { Text("Approvals") } footer: {
-                Text("Approve or Deny on \(DeviceWords.isMac ? "a notification" : "the Live Activity or a notification") opens the chat and, for the actions that matter, asks once more before it counts. Risky actions are writes, deletes and spends: a command that removes or changes files, pushes or deploys, installs, escalates, sends or pays for something, plus anything the smart guardian flagged. Reads and lookups apply at once, so the second question stays rare enough to mean something. The card's own buttons in the chat never ask twice.")
+                Text("Allow once or Deny on \(DeviceWords.isMac ? "a notification" : "the Live Activity or a notification") opens the chat and, for the actions that matter, asks once more before it counts. Risky actions are writes, deletes and spends: a command that removes or changes files, pushes or deploys, installs, escalates, sends or pays for something, plus anything the smart guardian flagged. Reads and lookups apply at once, so the second question stays rare enough to mean something. The card's own buttons in the chat never ask twice.")
             }
         }
     }
@@ -484,7 +523,7 @@ struct BotsSettingsView: View {
             SettingsHeaderSection(title: "Bots", symbol: "cloud.fill", color: .indigo, description: DeviceWords.isMac ? "What applies to every bot at once: the default bot and glass." : "What applies to every bot at once: the default bot, glass, motion and tilt.")
             if let rt = model.runtime {
                 Section {
-                    Picker("Default bot", selection: $defaultProfile) {
+                    Picker("Default bot", selection: defaultBot(rt)) {
                         Text("Follow the gateway").tag("")
                         ForEach(rt.profiles) { p in
                             Label { Text(p.label) } icon: { Image(uiImage: BotAvatarImage.cached(profile: p.name, scheme: colorScheme)).renderingMode(.original) }.tag(p.name)
@@ -566,6 +605,15 @@ struct BotsSettingsView: View {
             }
         }
         .onChange(of: glassAll) { _, _ in BotLooksMirror.mirror() }
+    }
+
+    /// The default bot setting, or in the demo the demo's own for its life (#494): a demo bot chosen here was kept, and
+    /// synced to the person's other devices.
+    private func defaultBot(_ rt: GatewayRuntime) -> Binding<String> {
+        Binding(get: { rt.isEphemeral ? rt.defaultProfileChoice : defaultProfile },
+                set: { v in
+                    if rt.isEphemeral { rt.defaultProfileChoice = v; rt.returnToDefaultProfile() } else { defaultProfile = v }
+                })
     }
 }
 
@@ -681,6 +729,7 @@ struct AppearanceView: View {
     @AppStorage(ComposeAction.tapKey) private var composeTap = ComposeAction.tapDefault.rawValue
     @AppStorage(ChatStyle.returnSends) private var returnSends = false
     #if os(iOS)
+    @AppStorage(ChatStyle.closeKeyboardAfterSend) private var closeKeyboardAfterSend = false
     @AppStorage(VoryTabBar.showVoiceKey) private var showVoiceButton = true
     @AppStorage(VoryTabBar.showLabelsKey) private var showTabLabels = true
     #endif
@@ -778,7 +827,19 @@ struct AppearanceView: View {
                     layoutRaw = l.encoded
                 }
             } header: {
-                HStack { Text("Tab bar · \(layout.tabs.count) of \(TabLayout.maxTabs)"); Spacer(); EditButton().font(.caption) }
+                HStack {
+                    Text("Tab bar · \(layout.tabs.count) of \(TabLayout.maxTabs)"); Spacer()
+                    // Edit and Done as EditButton had them, at their own size in the header, with a 44 pt hit area of the
+                    // button's own laid over it (the audit's minimum; a frame around EditButton left its own 22 by 14): the
+                    // header keeps its height and the word its place.
+                    let editing = editMode?.wrappedValue.isEditing == true
+                    Text(editing ? "Done" : "Edit").font(.caption).hidden().accessibilityHidden(true)
+                        .overlay {
+                            Button { withAnimation { editMode?.wrappedValue = editing ? .inactive : .active } } label: {
+                                Text(editing ? "Done" : "Edit").font(.caption).frame(minWidth: 44, minHeight: 44).contentShape(.rect)
+                            }
+                        }
+                }
             } footer: {
                 Text(editMode?.wrappedValue.isEditing == true
                      ? "Drag to reorder, swipe or − to remove. Chats and Settings can move but not go."
@@ -815,8 +876,10 @@ struct AppearanceView: View {
             #if os(iOS)
             Section {
                 Toggle("Return key sends", isOn: $returnSends)
+                Toggle("Close keyboard after sending", isOn: $closeKeyboardAfterSend)
+                    .accessibilityIdentifier("settings.closeKeyboardAfterSend")
             } header: { Text("Composer") } footer: {
-                Text("Off, the on-screen keyboard's Return adds a line, as in Messages, and the arrow sends. On, Return sends. On a hardware keyboard Return sends and Shift-Return adds a line either way; ⌘-Return sends too.")
+                Text("Return key sends: off, the on-screen keyboard's Return adds a line, as in Messages, and the arrow sends; on, Return sends. On a hardware keyboard Return sends and Shift-Return adds a line either way; ⌘-Return sends too. Close keyboard after sending: on, the keyboard goes down when a message goes; off, it stays up for the next one. A tap in the chat closes it either way.")
             }
             Section {
                 Toggle("Tab labels", isOn: $showTabLabels)
@@ -918,7 +981,7 @@ struct ResetView: View {
 
 struct AboutView: View {
     static let feedbackAddress = "matt@vory.dev"
-    static let sourceURL = URL(string: "https://github.com/matt0975/vory")!
+    static let sourceURL = URL(string: "https://github.com/vory-dev/vory")!
     @Environment(AppModel.self) private var model
     @State private var copiedAddress = false
     @State private var taps = 0
@@ -993,7 +1056,10 @@ struct AboutView: View {
                 }
                 .accessibilityHint("Copies the address")
                 Link(destination: URL(string: "https://vory.dev/privacy/")!) { Label("Privacy policy", systemImage: "hand.raised") }
+                // The site's name for VoiceOver, not its bare address read out letter by letter (#587).
                 Link(destination: URL(string: "https://vory.dev")!) { Label("vory.dev", systemImage: "safari") }
+                    .accessibilityLabel("Vory website")
+                    .accessibilityIdentifier("about.website")
                 // Vory is open source: the code anyone can read, and the licence it is under.
                 Link(destination: Self.sourceURL) {
                     LabeledContent { Text("MIT licence").foregroundStyle(.secondary) }
@@ -1001,6 +1067,9 @@ struct AboutView: View {
                 }
                 .accessibilityLabel("Source code on GitHub, MIT licence")
                 .accessibilityIdentifier("about.source")
+                // The open-source code inside the app, and each licence in full.
+                NavigationLink { AcknowledgementsView().pushedPage() } label: { Label("Acknowledgements", systemImage: "doc.text") }
+                    .accessibilityIdentifier("about.acknowledgements")
             } header: { Text("Vory") } footer: {
                 Text("A public beta. In TestFlight, take a screenshot to send feedback with it attached.")
             }
@@ -1107,23 +1176,27 @@ struct SoftwareUpdateView: View {
                                 }
                             }
                         }
-                    } else if setup.updateAvailable || setup.updating || setup.showUpdateConsole || setup.updateOutcome != nil {
-                        CompanionUpdateRows(setup: setup, runtime: rt)
+                    } else if CompanionUpdatePhase.of(available: setup.updateAvailable, updating: setup.updating,
+                                                      console: setup.showUpdateConsole, outcome: setup.updateOutcome) == .upToDate {
+                        // "Up to date" and the update card are two rows (#635), swapped inside the closing transaction:
+                        // the List animates a row deleted and one inserted, where a row's change of height jumps.
+                        CompanionUpToDateRow(setup: setup)
+                            .updateProbe("card")
                     } else {
-                        VStack(spacing: 8) {
-                            BotFaceView(spec: AboutView.voryBot, size: 56, mood: BotFaceView.Mood(profile: "vory-update", state: .guide, squint: setup.checkingCompanion))
-                            Text("Vory Companion \(PushSetupModel.bundledPluginVersion)").font(.headline)
-                            Text(setup.checkingCompanion ? "Checking for updates…" : "Your gateway is up to date.").font(.subheadline).foregroundStyle(.secondary)
-                                .contentTransition(.numericText())
+                        CompanionUpdateRows(setup: setup, runtime: rt)
+                            .updateProbe("card")
+                            .listRowSeparator(.hidden, edges: .bottom)
+                        // Update Complete's line, a row inserted inside that transaction rather than the card growing.
+                        if setup.updateOutcome?.ok == true {
+                            CompanionInstalledRow().listRowSeparator(.hidden, edges: .top)
                         }
-                        .frame(maxWidth: .infinity).padding(.vertical, 10)
-                        .animation(.snappy, value: setup.checkingCompanion)
                     }
                 } header: { sectionHeader("Vory Companion") } footer: {
                     Text("A small plugin on your gateway. It sends replies as notifications, \(DeviceWords.keepsActivity)and gets approval cards to \(DeviceWords.your) the moment a bot needs a yes. Installs in place; no restart unless it says so.")
                 }
                 Section {
                     LabeledContent("On the gateway", value: setup.installedVersion.map { "v\($0)" } ?? "—")
+                        .updateProbe("row")
                     if let hb = setup.heartbeat { LabeledContent("Running", value: "v\(hb.version)") }
                     LabeledContent("This build ships", value: "v\(PushSetupModel.bundledPluginVersion)")
                     Button { Task { await setup.checkCompanion(runtime: rt) } } label: {
@@ -1137,6 +1210,9 @@ struct SoftwareUpdateView: View {
         }
         .listSectionSpacing(28)
         .animation(.smooth, value: setup.updateOutcome == nil)
+        #if DEBUG && os(iOS)
+        .overlay(alignment: .topLeading) { if UpdateMotionProbe.isOn { UpdateMotionProbe.Readout().frame(width: 1, height: 1) } }
+        #endif
         .task { if let rt = model.runtime { await setup.prepare(runtime: rt) } }
         .reloadable { if let rt = model.runtime { await setup.checkCompanion(runtime: rt) } }
         // The cloud squints while it checks and turns once the answer is in.

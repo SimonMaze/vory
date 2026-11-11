@@ -98,11 +98,15 @@ final class PushRegistrar: PushRegistrationSyncing {
 
     func refreshAuthorization() async {
         authorization = await UNUserNotificationCenter.current().notificationSettings().authorizationStatus
+        authorizationRead = true
     }
+    /// Whether `authorization` has been read from the system yet (until then it is the default, not the answer). The
+    /// first read after a boot can take more than ten seconds.
+    private(set) var authorizationRead = false
 
     func requestAuthorization() async -> Bool {
         do {
-            let ok = try await UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound, .badge, .timeSensitive])
+            let ok = try await UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound, .badge])
             await refreshAuthorization()
             if ok { registerForRemote() }
             return ok
@@ -119,7 +123,26 @@ final class PushRegistrar: PushRegistrationSyncing {
         }
     }
 
+    /// Whether this device registers for push at all (#501): only with a gateway of the person's own saved, and never while
+    /// the demo runs. The demo sends nothing anywhere (its replies and approvals are local notifications), and
+    /// notifications allowed in it, with no gateway of the person's own, had every launch after send the token to the
+    /// relay for nothing that could ever be delivered. With a gateway of their own, nothing changes.
+    nonisolated static func mayRegister(inDemo: Bool, hasOwnGateway: Bool) -> Bool { !inDemo && hasOwnGateway }
+    private var mayRegisterNow: Bool {
+        var own = AppModel.shared.hasOwnGateway
+        #if DEBUG
+        if let o = Self.ownGatewayForTests { own = o }
+        #endif
+        return Self.mayRegister(inDemo: AppModel.shared.isInDemo, hasOwnGateway: own)
+    }
+    #if DEBUG
+    /// The tests' say on whether a gateway of the person's own is saved (#501), so the registration checks run the same
+    /// whatever gateways the test host has kept. DEBUG only, checked absent from Release at each cut.
+    nonisolated(unsafe) static var ownGatewayForTests: Bool?
+    #endif
+
     private func registerForRemote() {
+        guard mayRegisterNow else { return }
         #if os(iOS)
         UIApplication.shared.registerForRemoteNotifications()
         #else
@@ -153,7 +176,7 @@ final class PushRegistrar: PushRegistrationSyncing {
     /// With a relay baked into the build, the phone registers itself there; the gateway then only
     /// needs the install id + secret from the device file, never an APNs key.
     func registerWithRelay() async {
-        guard notificationsEnabled, PushRelay.isConfigured, let token = deviceToken else { return }
+        guard notificationsEnabled, PushRelay.isConfigured, mayRegisterNow, let token = deviceToken else { return }
         do {
             try await PushRelay.register(deviceToken: token, platform: Self.platform, bundleID: Bundle.main.bundleIdentifier ?? "", environment: apnsEnvironment, liveActivityToken: nil)
             relayRegisteredAt = Date(); relayError = nil
@@ -233,7 +256,7 @@ final class PushRegistrar: PushRegistrationSyncing {
     }
 
     func syncRegistration(runtime: GatewayRuntime) async {
-        guard notificationsEnabled else { return }
+        guard notificationsEnabled, !runtime.isEphemeral else { return }
         guard let token = deviceToken, let home = runtime.profileHome else { return }
         let path = "\(home)/push/devices/\(installID).json"
         var payload: [String: JSONValue] = [
@@ -260,16 +283,21 @@ final class PushRegistrar: PushRegistrationSyncing {
         ]
         #if os(iOS)
         // The bots' looks, for the activity the companion starts by push; the Mac has no Live Activity.
+        // This gateway's looks (#573), whichever gateway is in use.
+        let gateway = runtime.connection.id
         payload["bots"] = .object(Dictionary(uniqueKeysWithValues: runtime.profiles.map { p in
-            let looks = BotLooks.load()
+            let looks = BotLooks.load().forGateway(gateway.uuidString)
             let key = looks.key(profile: p.name, label: p.label) ?? p.name
-            return (p.name, JSONValue.object(["label": .string(p.label), "hex": .string(looks.colors[key] ?? BotColors.hex(for: p.name)),
-                                               "avatar": .string(looks.avatars[key] ?? BotAvatarStore.choice(for: p.name).raw)]))
+            return (p.name, JSONValue.object(["label": .string(p.label), "hex": .string(looks.colors[key] ?? BotColors.hex(for: p.name, gateway: gateway)),
+                                               "avatar": .string(looks.avatars[key] ?? BotAvatarStore.choice(for: p.name, gateway: gateway).raw)]))
         }))
         #endif
         #if os(iOS)
         // Quiet while a Mac drives the chat (Settings › Notifications); the Companion reads this.
         payload["mute_desktop_origin"] = .bool(UserDefaults.standard.bool(forKey: Self.muteDesktopOriginKey))
+        // This build's Live Activity opens sealed names and goal lines (#497): a relay-mode Companion seals them for it.
+        // Without this an older app's activity would show them blank, so the Companion keeps them plain for it.
+        payload["la_sealed"] = .number(1)
         #endif
         payload.merge(PushRelay.deviceFileFields()) { $1 }
         do {
@@ -293,13 +321,66 @@ final class PushRegistrar: PushRegistrationSyncing {
         }
     }
 
-    func removeRegistration(runtime: GatewayRuntime) async {
-        await PushRelay.unregister()
+    /// Takes this device's registration away from one gateway: its device file there, and the relay's record when no
+    /// other gateway of the person's own is left to send through it (`relayForgets`). `everywhere`: this device is to take
+    /// pushes from no gateway now (notifications turned off, the app reset), so the relay forgets it whatever is saved.
+    func removeRegistration(runtime: GatewayRuntime, everywhere: Bool) async {
+        if Self.relayForgets(everywhere: everywhere, otherOwnGateways: ownGateways(besides: runtime.connection.id)) {
+            await unregisterFromRelay()
+        }
         guard let home = runtime.profileHome else { return }
         let path = "\(home)/push/devices/\(installID).json"
         let _: JSONValue? = try? await runtime.api.send("DELETE", "/api/files", json: ["path": .string(path), "recursive": false])
         if lastRegistrationPath == path { lastRegistrationPath = nil; registeredAt = nil }
     }
+
+    /// Settings' Notifications toggle: on registers this device with the relay and the open gateway; off takes it off
+    /// every gateway, the relay with them, whether a gateway is open or not (#509; with none open, off left the relay
+    /// holding the token).
+    func notificationsTurned(on: Bool, runtime: GatewayRuntime?) async {
+        // Never in the demo (#392): it has no gateway and no relay, and the relay's credentials, minted when there are
+        // none, would be saved and sent for it. Settings greys the toggle there too.
+        guard !AppModel.shared.isInDemo, runtime?.isEphemeral != true else { return }
+        guard on else { await removeEverywhere(runtime: runtime); return }
+        guard let runtime else { return }
+        await registerWithRelay()
+        await syncRegistration(runtime: runtime)
+    }
+
+    /// This device is to take pushes from no gateway any more (notifications turned off, the app reset, #509): the open gateway's device file goes,
+    /// and the relay forgets the install whether a gateway is open or not. With none open, the relay kept this device's
+    /// token after the reset, and an old gateway's Companion could go on pushing to it. The relay needs only the install's
+    /// id and secret, so call this before the Keychain is wiped.
+    func removeEverywhere(runtime: GatewayRuntime?) async {
+        if let runtime { await removeRegistration(runtime: runtime, everywhere: true) } else { await unregisterFromRelay() }
+    }
+
+    private func unregisterFromRelay() async {
+        await PushRelay.unregister()
+        // Registered again at the next foreground, not up to a day later (`refreshRelayIfStale`).
+        relayRegisteredAt = nil
+    }
+
+    /// Whether the relay forgets this install as one gateway's registration goes (#509). The relay keeps one record per
+    /// install, and every gateway with this device's file sends through it: taken away with one gateway's removal (or its
+    /// Companion's), the other gateways' pushes stopped. It goes with the last of the person's gateways only, or when the
+    /// device is to take pushes from none.
+    nonisolated static func relayForgets(everywhere: Bool, otherOwnGateways: Bool) -> Bool { everywhere || !otherOwnGateways }
+
+    /// Whether a gateway of the person's own other than `id` is saved. A removed gateway is still saved when its
+    /// registration goes.
+    private func ownGateways(besides id: UUID) -> Bool {
+        var ids = AppModel.shared.store.connections.map(\.id)
+        #if DEBUG
+        if let saved = Self.ownGatewaysForTests { ids = saved }
+        #endif
+        return ids.contains { $0 != id }
+    }
+    #if DEBUG
+    /// The tests' list of the person's saved gateways (#509), so the relay checks run the same whatever gateways the test
+    /// host has kept. DEBUG only, checked absent from Release at each cut.
+    nonisolated(unsafe) static var ownGatewaysForTests: [UUID]?
+    #endif
 }
 
 extension Notification.Name {
@@ -317,6 +398,26 @@ final class LocalCardNotifier: CardNotifying {
 
 /// Local notifications for cards and finished turns while the app is not in the foreground.
 enum LocalNotifier {
+    /// Removes every notification a gateway's chats left, delivered or waiting: leaving the demo (#392) leaves none.
+    /// With `deliveredBefore`, a delivered one only if it came before then (the launch sweep's, #632). `done` gets how many
+    /// went, delivered and waiting.
+    static func removeAll(connection: UUID, deliveredBefore before: Date? = nil, done: (@Sendable (Int) -> Void)? = nil) {
+        let id = connection.uuidString
+        @Sendable func entry(_ r: UNNotificationRequest, _ date: Date?) -> DemoLeftovers.Entry {
+            DemoLeftovers.Entry(id: r.identifier, connection: (r.content.userInfo["hermes"] as? [String: Any])?["connection_id"] as? String, date: date)
+        }
+        // The center asked for again inside each answer, not captured: it isn't Sendable.
+        UNUserNotificationCenter.current().getDeliveredNotifications { d in
+            let delivered = DemoLeftovers.notifications(d.map { entry($0.request, $0.date) }, of: id, before: before)
+            UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: delivered)
+            UNUserNotificationCenter.current().getPendingNotificationRequests { p in
+                let waiting = DemoLeftovers.notifications(p.map { entry($0, nil) }, of: id, before: nil)
+                UNUserNotificationCenter.current().removePendingNotificationRequests(withIdentifiers: waiting)
+                done?(delivered.count + waiting.count)
+            }
+        }
+    }
+
     static let approvalCategory = "HERMES_APPROVAL"
     static let clarifyCategory = "HERMES_CLARIFY"
     static let turnCategory = "HERMES_TURN"
@@ -330,8 +431,10 @@ enum LocalNotifier {
     /// would arrive as a duplicate.
     /// Only a gateway with the Companion on it sends anything: registered with a gateway that has
     /// none, the phone would have waited for pushes that never come and shown nothing itself.
+    /// Never in the demo (#501): the Companion is the person's gateway's, and its installed version, left from that gateway
+    /// until the next refresh, kept the demo's local notifications from showing.
     @MainActor static var companionDelivers: Bool {
-        AppModel.shared.push.registeredAt != nil && PushRelay.isConfigured && AppModel.shared.companionInstalledVersion != nil
+        !AppModel.shared.isInDemo && AppModel.shared.push.registeredAt != nil && PushRelay.isConfigured && AppModel.shared.companionInstalledVersion != nil
     }
     @MainActor private static func botName(_ chat: ChatSession) -> String {
         chat.runtime.profiles.first { $0.name == chat.profileName }?.label ?? chat.profileName
@@ -343,7 +446,7 @@ enum LocalNotifier {
         var approveOptions: UNNotificationActionOptions = [.authenticationRequired]
         var denyOptions: UNNotificationActionOptions = [.destructive, .authenticationRequired]
         if ApprovalConfirm.isOn { approveOptions.insert(.foreground); denyOptions.insert(.foreground) }
-        let approve = UNNotificationAction(identifier: approveOnceAction, title: "Approve once", options: approveOptions)
+        let approve = UNNotificationAction(identifier: approveOnceAction, title: "Allow once", options: approveOptions)
         let deny = UNNotificationAction(identifier: denyAction, title: "Deny", options: denyOptions)
         let approval = UNNotificationCategory(identifier: approvalCategory, actions: [approve, deny], intentIdentifiers: [], options: [])
         let clarify = UNNotificationCategory(identifier: clarifyCategory, actions: [], intentIdentifiers: [], options: [])
@@ -464,3 +567,111 @@ enum LocalNotifier {
         UNUserNotificationCenter.current().add(req)
     }
 }
+
+/// What the demo showed outside the app (#632): its turns' Live Activities (iOS) and its notifications. Leave demo takes
+/// them away (`takeAway`). A demo that ended with the app (quit or killed inside it) could not, so every launch takes
+/// what is left (`sweepAtLaunch`). The demo lives in memory only, so nothing of the demo's at a launch is this process's,
+/// even under a test build's `-vory-demo`: unlike `DemoTraces.sweepAtLaunch`, this runs with the demo in use too. It
+/// matches the demo's gateway id only: a card's `connectionID`, a notification's `hermes.connection_id`.
+enum DemoLeftovers {
+    /// When this process started, as near as the app model's first moment (`AppModel.init` reads it first).
+    static let launchedAt = Date()
+
+    /// At launch, before the demo's runtime can start (it starts after the app model): the demo's cards, its
+    /// notifications delivered before this launch, and its waiting ones. One activity line for each, with the count.
+    @MainActor static func sweepAtLaunch() {
+        let before = launchedAt
+        #if DEBUG
+        sweepsForTests += 1
+        #endif
+        #if os(iOS)
+        let cards = LiveActivityController.endAll(connection: GatewayConnection.demoID)
+        #else
+        let cards = 0   // the Mac has no Live Activity
+        #endif
+        LiveActivityController.note("launch: the demo's leftovers: \(cards) cards ended")
+        LocalNotifier.removeAll(connection: GatewayConnection.demoID, deliveredBefore: before) { n in
+            LiveActivityController.note("launch: the demo's leftovers: \(n) notifications removed")
+        }
+    }
+
+    /// Leave demo's: every card and notification of the demo's, whenever it showed them.
+    @MainActor static func takeAway() {
+        #if DEBUG
+        takenAwayForTests += 1
+        #endif
+        #if os(iOS)
+        LiveActivityController.endAll(connection: GatewayConnection.demoID)
+        #endif
+        LocalNotifier.removeAll(connection: GatewayConnection.demoID)
+    }
+
+    /// One delivered or waiting notification, as the filter reads it.
+    struct Entry: Sendable {
+        let id: String
+        /// Its `hermes.connection_id`; nil when it has none.
+        let connection: String?
+        /// When it was delivered; nil for one still waiting.
+        let date: Date?
+    }
+
+    /// The notifications of a gateway to take: each one of its own, a delivered one only if it came before `before`
+    /// (all of them with no `before`).
+    static func notifications(_ all: [Entry], of connection: String, before: Date?) -> [String] {
+        all.filter { e in
+            guard e.connection == connection else { return false }
+            guard let before, let date = e.date else { return true }
+            return date < before
+        }.map(\.id)
+    }
+
+    /// The cards of a gateway to end, from (id, connection id) pairs: its own only. A card from before cards carried
+    /// their gateway has an empty connection id, and is left to `settleAtForeground`.
+    static func cards(_ all: [(id: String, connection: String)], of connection: String) -> [String] {
+        all.filter { $0.connection == connection }.map(\.id)
+    }
+
+    #if DEBUG
+    /// For the units: how many times the launch sweep ran in this process, and Leave demo's clean-up.
+    @MainActor static var sweepsForTests = 0
+    @MainActor static var takenAwayForTests = 0
+    #endif
+}
+
+#if DEBUG && os(iOS)
+import SwiftUI
+
+/// DEBUG, for #501's check: with `-vory-delivered-readout`, a 1 pt element ("debug.delivered") whose value is how many of
+/// the demo's local notifications are delivered and how many are pending, and the most ever delivered at once,
+/// "delivered/pending/most" (by their `hermes.connection_id`), read again every second, in the background too while the
+/// app is kept awake (a notification cleared on the way back counts in "most"). A UI test reads it after sending the app
+/// away in the demo, and again after Leave demo. DEBUG only, checked absent from Release at each cut.
+struct DemoDeliveredReadout: View {
+    static let isOn = ProcessInfo.processInfo.arguments.contains("-vory-delivered-readout")
+    @State private var value = "-1/-1/0/-1"
+    @State private var most = 0
+
+    var body: some View {
+        Text(" ").font(.system(size: 1))
+            .accessibilityIdentifier("debug.delivered")
+            .accessibilityValue(value)
+            .task {
+                func demo(_ c: UNNotificationContent) -> Bool {
+                    (c.userInfo["hermes"] as? [String: Any])?["connection_id"] as? String == GatewayConnection.demoID.uuidString
+                }
+                while !Task.isCancelled {
+                    // The app's own read of the notification settings, -1 until it has come (the UI test waits for it
+                    // before its first message: after a boot the read can outlast the test's wait for the question).
+                    let push = AppModel.shared.push
+                    let read = push.authorizationRead ? push.authorization.rawValue : -1
+                    let center = UNUserNotificationCenter.current()
+                    let delivered = await center.deliveredNotifications().filter { demo($0.request.content) }.count
+                    let pending = await center.pendingNotificationRequests().filter { demo($0.content) }.count
+                    most = max(most, delivered)
+                    value = "\(delivered)/\(pending)/\(most)/\(read)"
+                    try? await Task.sleep(for: .seconds(1))
+                }
+            }
+    }
+}
+#endif

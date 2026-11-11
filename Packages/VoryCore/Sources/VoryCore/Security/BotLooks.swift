@@ -10,13 +10,39 @@ public struct BotLooks: Codable, Sendable {
     public var avatars: [String: String]
     /// `{profile: JPEG}` for photo avatars, kept small (about 128 px).
     public var photos: [String: Data]
+    /// One gateway's looks, as the three maps above are for the gateway in use (#573).
+    public struct Gateway: Codable, Sendable {
+        public var colors: [String: String]
+        public var avatars: [String: String]
+        public var photos: [String: Data]
+        public init(colors: [String: String] = [:], avatars: [String: String] = [:], photos: [String: Data] = [:]) {
+            self.colors = colors
+            self.avatars = avatars
+            self.photos = photos
+        }
+    }
+    /// Each gateway's looks by its connection's id: its own, else the ones from before (#573). Nil in a copy made before
+    /// looks were kept per gateway.
+    public var gateways: [String: Gateway]?
+    /// The looks from before, kept by name alone: what a gateway that isn't listed shows.
+    public var shared: Gateway?
 
     public static let account = "botLooks"
 
-    public init(colors: [String: String] = [:], avatars: [String: String] = [:], photos: [String: Data] = [:]) {
+    public init(colors: [String: String] = [:], avatars: [String: String] = [:], photos: [String: Data] = [:],
+                gateways: [String: Gateway]? = nil, shared: Gateway? = nil) {
         self.colors = colors
         self.avatars = avatars
         self.photos = photos
+        self.gateways = gateways
+        self.shared = shared
+    }
+
+    /// The looks to draw a push from the gateway `connectionID` with (#573): that gateway's, else the ones from before,
+    /// else (a push that names no gateway, or a copy made before looks were per gateway) the gateway in use's.
+    public func forGateway(_ connectionID: String?) -> BotLooks {
+        guard let connectionID, let gateways, let g = gateways[connectionID] ?? shared else { return self }
+        return BotLooks(colors: g.colors, avatars: g.avatars, photos: g.photos)
     }
 
     public static func load() -> BotLooks { Keychain.getCodable(BotLooks.self, account: account) ?? BotLooks() }
@@ -29,4 +55,14 @@ public struct BotLooks: Codable, Sendable {
         return (Array(colors.keys) + Array(avatars.keys)).first { wanted.contains($0.lowercased()) }
     }
     public func save() { try? Keychain.setCodable(self, account: Self.account) }
+
+    /// A bot's colour as the extensions draw it (#506): the one in this copy under `key`, else the default the app gives a
+    /// bot by its name (`BotPalette`, the same on every device). A bot never recoloured is missing from the copy until it
+    /// catches up with the gateway's bots, and was drawn in a fixed purple in a pushed notification, another colour in the
+    /// app. `profile`, the bot's name, picks the default when `key` is a label.
+    public func color(for key: String, profile: String? = nil) -> String {
+        if let h = colors[key], !h.isEmpty { return h }
+        let name = profile.flatMap { $0.isEmpty ? nil : $0 } ?? key
+        return BotPalette.defaultHex(for: name)
+    }
 }

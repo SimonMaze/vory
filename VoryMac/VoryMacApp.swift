@@ -123,13 +123,15 @@ struct VoryMacApp: App {
         .defaultSize(width: 980, height: 700)
         // Opening Vory always shows its window (#328: a window closed before quitting meant a
         // launch from Finder, Spotlight or Launchpad could show only the menu bar item). A launch at
-        // login shows it too (judgement call #7). Restoration stays on, so the window keeps its
+        // login shows it too. Restoration stays on, so the window keeps its
         // size and place.
         .defaultLaunchBehavior(.presented)
         .commands {
             // Settings… (⌘,) is the Settings tab of the window; the app has one state, not two windows.
             CommandGroup(replacing: .appSettings) {
                 Button("Settings…") { model.selectedTab = .settings }.keyboardShortcut(",", modifiers: .command)
+                // In the demo (#392), the way out is in the app's menu too, as Settings' Leave demo.
+                if model.isInDemo { Button("Leave Demo") { Task { await model.endDemo() } } }
             }
             // File › Import from iPhone or iPad: Continuity Camera into the composer.
             ImportFromDevicesCommands()
@@ -159,7 +161,7 @@ struct VoryMacApp: App {
                 Button("Stop") { if let c = frontChat { Task { await c.stop() } } }
                     .keyboardShortcut(".", modifiers: .command)
                     .disabled(frontChat?.isRunning != true)
-                Button("Approve Once") { answerApproval("once") }
+                Button("Allow Once") { answerApproval("once") }
                     .keyboardShortcut("y", modifiers: [.command, .shift])
                     .disabled(pendingApproval == nil)
                 Button("Deny") { answerApproval("deny") }

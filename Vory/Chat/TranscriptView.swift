@@ -163,6 +163,25 @@ struct TranscriptView: View {
     private var bubbleCap: CGFloat {
         wide ? (wideReplies ? columnWidth : max(320, columnWidth * 0.72)) : .infinity
     }
+    /// The widest the thread's column may be: the reading column on a wide layout, and on iOS never wider than the
+    /// window's safe area (`SafeColumn`). At a push on the closed iPhone Duo the scroll view's first layout has the
+    /// whole window's width, before the side strip's inset reaches it: every row was laid there one line short, then
+    /// all of them again at the safe width before the first frame. The window's own safe area has the strip already,
+    /// so the column lays the rows at that width from the first layout. A window with no side insets, or a column
+    /// narrower than its window, never meets this limit. No limit while the window is held (`WindowGeometry.holding`):
+    /// the open Duo's turn holds the old window, and the limit must not keep a closed width through it. The Mac's limit
+    /// is the reading column alone, as before.
+    private var columnLimit: CGFloat {
+        let reading = wide ? ChatStyle.readingColumn : .infinity
+        #if os(iOS)
+        guard ThreadFix.on, !windowGeometry.holding else { return reading }
+        return min(reading, SafeColumn.width(window: windowGeometry.bounds.width,
+                                             leading: windowGeometry.safeArea.leading,
+                                             trailing: windowGeometry.safeArea.trailing))
+        #else
+        return reading
+        #endif
+    }
 
     private var visibleItems: [TranscriptItem] {
         chat.items.filter { item in
@@ -291,7 +310,7 @@ struct TranscriptView: View {
                 // one, so the content held a height the stack no longer had and the stack sat centred in
                 // it, cut at the end and banded at the top (#704). The column puts the stack at its top
                 // and is sized again, once, when the rows have settled (`ThreadSizing`).
-                .modifier(ThreadColumnSizing(sizing: sizing, maxWidth: wide ? ChatStyle.readingColumn : .infinity, columnWidth: $columnWidth))
+                .modifier(ThreadColumnSizing(sizing: sizing, maxWidth: columnLimit, columnWidth: $columnWidth))
                 #if os(macOS)
                 .modifier(ThreadHitGate.Gate(gate: hitGate))
                 #endif
@@ -1347,9 +1366,31 @@ extension TranscriptView {
             }
             guard !Task.isCancelled, !metrics.userScrolling, !landingOutOfSight else { return }
             sizing.revision += 1
+            #if os(iOS)
+            figuresFromUIKit()
+            #endif
             idleSizing = nil
         }
     }
+    #if os(iOS)
+    /// After the quiet sizing (`sizeWhenQuiet`): a sizing that changed nothing leaves SwiftUI's scroll geometry with
+    /// nothing to report, and its last report can stand short of where UIKit has the thread. When UIKit's height or
+    /// offset is more than half a point from the reported ones (`ScrollTruth.distance`), the thread's figures take
+    /// UIKit's, the distance by the end's settle's sum, and the away flags are decided again on them. Writing the
+    /// figures lays out and draws nothing, as they are not observed; only a change of the away flags, decided again
+    /// here, can show.
+    private func figuresFromUIKit() {
+        guard let sv = metrics.scrollView,
+              let d = ScrollTruth.distance(height: sv.contentSize.height, offset: sv.contentOffset.y,
+                                           bottomInset: sv.adjustedContentInset.bottom, boundsHeight: sv.bounds.height,
+                                           reportedHeight: metrics.contentHeight, reportedOffset: metrics.offsetY)
+        else { return }
+        metrics.contentHeight = sv.contentSize.height
+        metrics.offsetY = sv.contentOffset.y
+        metrics.distanceFromBottom = d
+        decideAway()
+    }
+    #endif
 
     /// A landing past the end while the thread is out of sight: the reveal waits for one that sticks (`revealIfLanded`).
     private func noteLanding() {
@@ -1700,6 +1741,29 @@ private struct ThreadColumn: Layout {
                     proposal: ProposedViewSize(width: min(bounds.width, maxWidth), height: nil))
     }
 }
+
+#if os(iOS)
+/// The thread's distance from its end by UIKit's own figures (`TranscriptView.figuresFromUIKit`): nil when UIKit's
+/// height and offset are both within half a point of the thread's figures as last set (SwiftUI's report, or UIKit's
+/// after an earlier write), so nothing is written; else the content's height plus the bottom inset, less the scroll
+/// view's height and the offset, the sum the end's settle reads (`endSettleCheck`).
+enum ScrollTruth {
+    static func distance(height: CGFloat, offset: CGFloat, bottomInset: CGFloat, boundsHeight: CGFloat,
+                         reportedHeight: CGFloat, reportedOffset: CGFloat) -> CGFloat? {
+        guard abs(height - reportedHeight) > 0.5 || abs(offset - reportedOffset) > 0.5 else { return nil }
+        return height + bottomInset - boundsHeight - offset
+    }
+}
+
+/// The width a thread's column may take in its window (`TranscriptView.columnLimit`): the window's width less its side
+/// insets (the closed iPhone Duo's side strip), or no limit while the window has no width to give.
+enum SafeColumn {
+    static func width(window: CGFloat, leading: CGFloat, trailing: CGFloat) -> CGFloat {
+        let width = window - max(0, leading) - max(0, trailing)
+        return window > 0 && width > 0 ? width : .infinity
+    }
+}
+#endif
 
 /// The figures a scroll changes every frame. Not observable on purpose (see `TranscriptView.metrics`).
 /// The thread's scroll geometry as one reading (#453): its content height, its window's height, and how far its end is

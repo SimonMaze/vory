@@ -1501,19 +1501,42 @@ struct MorphPressStyle: ButtonStyle {
     }
 }
 
+/// Whether a slot's changed measure animates to its new frame (`measured`): a change of a frame that had an old one does
+/// (a tab switch moves and resizes the capsules: the morph), and only with the scene active. A first measure is set at
+/// once, and so is any change while the scene is inactive or in the background (58): an animation begun then didn't
+/// advance until the app's next pass after activation, and a fold made with the app away drew the row it had before (the
+/// face 79 pt low, the band down the status strip) for 0.6 s after the return.
+enum MorphMeasure {
+    static func animates(changed: Bool, hadOld: Bool, phase: ScenePhase) -> Bool { changed && hadOld && phase == .active }
+}
+
 private extension View {
     /// Reports this view's frame in the bar's space under its slot. A change after the first
     /// measurement animates (a tab switch moves and resizes the capsules: the morph); a slot
     /// that goes away leaves its last frame so its capsule can fade out where it was.
     func measured(_ slot: MorphSlot, into frames: Binding<[MorphSlot: CGRect]>, last: Binding<[MorphSlot: CGRect]>? = nil,
                   rootRow: Bool = false) -> some View {
-        onGeometryChange(for: CGRect.self) { $0.frame(in: .named("morph")) } action: { f in
+        modifier(MeasuredFrame(slot: slot, frames: frames, last: last, rootRow: rootRow))
+    }
+}
+
+/// `measured`'s work, as a modifier so it reads its own scene's phase from the environment (`MorphMeasure.animates`).
+private struct MeasuredFrame: ViewModifier {
+    let slot: MorphSlot
+    let frames: Binding<[MorphSlot: CGRect]>
+    let last: Binding<[MorphSlot: CGRect]>?
+    let rootRow: Bool
+    @Environment(\.scenePhase) private var phase
+
+    func body(content: Content) -> some View {
+        content.onGeometryChange(for: CGRect.self) { $0.frame(in: .named("morph")) } action: { f in
             #if DEBUG
             // The launch probe (#555): every trailing frame measured, against the one drawn ("trail").
             if slot == .trail { MorphFramesProbe.note("mtrail", f) }
             #endif
             guard frames.wrappedValue[slot] != f else { return }
-            if frames.wrappedValue[slot] != nil || last?.wrappedValue[slot] != nil {
+            let hadOld = frames.wrappedValue[slot] != nil || last?.wrappedValue[slot] != nil
+            if MorphMeasure.animates(changed: true, hadOld: hadOld, phase: phase) {
                 withAnimation(.snappy(duration: 0.22)) { frames.wrappedValue[slot] = f }
             } else {
                 frames.wrappedValue[slot] = f

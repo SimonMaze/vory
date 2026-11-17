@@ -16,14 +16,16 @@ struct ChatsSplitPage: View {
     @Environment(\.reservedRegions) private var regions
     @State private var columns = NavigationSplitViewVisibility.doubleColumn
     @Environment(\.scenePhase) private var scenePhase
-    /// The columns as they stood when the scene went into the background, kept until it is active again. In the
+    /// The columns as they stood when the scene went into the background wide, kept until it is active again. In the
     /// background the system lays the scene out for its snapshot at its own compact size class (the open Duo on its
     /// side), the split view collapses there, and it came back showing the chat alone, the list column gone (#537). For
-    /// that trip the split view's writes are let go, and the page's own visibility is put back once the scene is
-    /// active. While the scene is active (a narrowed iPad window, a turn, the sidebar button) every write is taken.
+    /// that trip the split view's writes are let go. The hold goes once the scene is active, whichever branch is on
+    /// screen then, and the page's own columns are put back only on a wide return. Folded closed while away, the return
+    /// is narrow: the hold outlived the split branch and dropped the next wide window's sidebar button (58). While
+    /// nothing is held (a narrowed iPad window, a turn, the sidebar button) every write is taken.
     @State private var columnsBeforeBackground: NavigationSplitViewVisibility?
     private var columnsBinding: Binding<NavigationSplitViewVisibility> {
-        Binding(get: { columns }, set: { if columnsBeforeBackground == nil { columns = $0 } })
+        Binding(get: { columns }, set: { if Self.takesSplitWrite(held: columnsBeforeBackground) { columns = $0 } })
     }
     /// The split view's leading edge in the window (a bar down the leading side moves it in).
     @State private var leading: CGFloat = 0
@@ -47,6 +49,16 @@ struct ChatsSplitPage: View {
     }
 
     var body: some View {
+        page
+            // On the page, not the split branch: the hold goes on the return whichever branch is on screen (58).
+            .onChange(of: scenePhase) { _, phase in
+                let next = Self.columnsOnPhase(phase, wide: wide, columns: columns, held: columnsBeforeBackground)
+                if next.held != columnsBeforeBackground { columnsBeforeBackground = next.held }
+                if next.columns != columns { columns = next.columns }
+            }
+    }
+
+    @ViewBuilder private var page: some View {
         if wide {
             NavigationSplitView(columnVisibility: columnsBinding) {
                 ChatListView(detailPath: chatPath)
@@ -70,10 +82,6 @@ struct ChatsSplitPage: View {
             }
             .navigationSplitViewStyle(.balanced)
             .onGeometryChange(for: CGFloat.self) { $0.frame(in: .global).minX } action: { leading = $0 }
-            .onChange(of: scenePhase) { _, phase in
-                if phase == .background, columnsBeforeBackground == nil { columnsBeforeBackground = columns }
-                if phase == .active, let held = columnsBeforeBackground { columnsBeforeBackground = nil; columns = held }
-            }
         } else {
             // One column (a phone, the closed Duo, the open Duo upright, a narrow window): the
             // list's own stack on the same path. The split view collapsed to one column left
@@ -100,6 +108,26 @@ struct ChatsSplitPage: View {
             .onAppear { columns = .doubleColumn }
         }
     }
+}
+
+extension ChatsSplitPage {
+    /// The columns' hold across a trip to the background (#537, 58). Inputs: the scene's new phase; whether the page is
+    /// wide then (`wideLayout`, held while the scene is in the background, so the window as it stood when the scene left,
+    /// and the live one once the scene is back); the columns; and what is held. Held as the scene goes into the
+    /// background wide. Let go once the scene is active, wide or not. Put back only if the page is wide then: a narrow
+    /// return has set two columns for the next wide window already (#547), which a held "detail only" would undo.
+    nonisolated static func columnsOnPhase(_ phase: ScenePhase, wide: Bool, columns: NavigationSplitViewVisibility,
+                                           held: NavigationSplitViewVisibility?)
+        -> (columns: NavigationSplitViewVisibility, held: NavigationSplitViewVisibility?) {
+        switch phase {
+        case .background where wide && held == nil: return (columns, columns)
+        case .active: return (wide ? (held ?? columns) : columns, nil)
+        default: return (columns, held)
+        }
+    }
+
+    /// The split view's own writes are taken only while nothing is held.
+    nonisolated static func takesSplitWrite(held: NavigationSplitViewVisibility?) -> Bool { held == nil }
 }
 
 /// The detail column before a chat is chosen (a wide window only; collapsed, the list is in front).

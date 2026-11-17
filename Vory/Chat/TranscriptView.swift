@@ -69,7 +69,7 @@ struct TranscriptView: View {
     var keyboardFloors = true
     /// The header band's fade (`ChatStyle.bandFade` on iOS, 0 where there is no band): added to
     /// the top margin so the first row reads whole. The bottom has no fade above the bar (the
-    /// thread shows through the field's glass, Matt 2026-10-10): the last row ends 8 pt above
+    /// thread shows through the field's glass, 2026-10-10): the last row ends 8 pt above
     /// the dock, as before.
     var bandFade: CGFloat = 0
     /// `scrollTop` is 0 when the thread starts at the window's top edge (it runs under the status
@@ -78,6 +78,14 @@ struct TranscriptView: View {
     /// Locked to the bottom: the thread follows every new token, tool call and card. Only the
     /// user's own drag releases it; the jump button (or scrolling back down) locks it again.
     @State private var awayFromBottom = false
+    /// The Jump to latest button's own flag, with hysteresis (on above 120 pt, off below 60, under a finger below 24), so
+    /// `awayFromBottom` (the size-change anchor's) keeps the plain 120 pt rule and the button doesn't flicker.
+    @State private var awayButton = false
+    /// The scene's phase as this view's scene has it: on the Mac, its going to the background is when the plain rows
+    /// cross into the lazy stack (`crossOffScreen`).
+    @Environment(\.scenePhase) private var scenePhase
+    /// This thread's place keeper (`ThreadAnchor`): made with the view, handed to its rows, new for each chat.
+    @State private var anchor = ThreadAnchor()
     /// A card is opening or closing: the thread's size changes anchor at the top meanwhile, so the card keeps its place
     /// (`holdCard`). Bumped per toggle, so an earlier toggle's release stands down.
     @State private var holdingCard = false
@@ -97,6 +105,10 @@ struct TranscriptView: View {
     /// object, not view state: writing view state per frame re-evaluated this whole body, and
     /// every row with it, on every frame of a flick.
     @State private var metrics = ScrollMetrics()
+    /// What sizes the thread's content again once its rows have settled (#704): read only by its column (`ThreadColumnSizing`).
+    @State private var sizing = ThreadSizing()
+    /// The sizing after a finger's scroll, waiting for two frames of real rest (`sizeAtRest`).
+    @State private var idleSizing: Task<Void, Never>?
     #if os(macOS)
     /// Whether the thread is scrolling, read only by the rows' hit-test gate (`ThreadHitGate`).
     @State private var hitGate = ThreadHitGate()
@@ -151,6 +163,25 @@ struct TranscriptView: View {
     private var bubbleCap: CGFloat {
         wide ? (wideReplies ? columnWidth : max(320, columnWidth * 0.72)) : .infinity
     }
+    /// The widest the thread's column may be: the reading column on a wide layout, and on iOS never wider than the
+    /// window's safe area (`SafeColumn`). At a push on the closed iPhone Duo the scroll view's first layout has the
+    /// whole window's width, before the side strip's inset reaches it: every row was laid there one line short, then
+    /// all of them again at the safe width before the first frame. The window's own safe area has the strip already,
+    /// so the column lays the rows at that width from the first layout. A window with no side insets, or a column
+    /// narrower than its window, never meets this limit. No limit while the window is held (`WindowGeometry.holding`):
+    /// the open Duo's turn holds the old window, and the limit must not keep a closed width through it. The Mac's limit
+    /// is the reading column alone, as before.
+    private var columnLimit: CGFloat {
+        let reading = wide ? ChatStyle.readingColumn : .infinity
+        #if os(iOS)
+        guard ThreadFix.on, !windowGeometry.holding else { return reading }
+        return min(reading, SafeColumn.width(window: windowGeometry.bounds.width,
+                                             leading: windowGeometry.safeArea.leading,
+                                             trailing: windowGeometry.safeArea.trailing))
+        #else
+        return reading
+        #endif
+    }
 
     private var visibleItems: [TranscriptItem] {
         chat.items.filter { item in
@@ -184,10 +215,24 @@ struct TranscriptView: View {
                                showReasoning: showReasoning, day: day)
         return rowCache.rows(for: key) { TranscriptRowModel.build(visibleItems, now: day) }
     }
-    /// True while the last item is a reply still waiting for its first words (that row shows
-    /// the typing bubble itself).
-    private var lastIsEmptyStreamingReply: Bool {
-        if case .assistant(let t, _, let streaming) = chat.items.last?.kind { return streaming && t.isEmpty }
+    /// Under the fix (`ThreadFix`), true while the last item is a reply still streaming, waiting for its first words (that
+    /// row shows the typing bubble itself) or with words: the standalone typing bubble isn't shown under it, so a turn
+    /// that ends on streamed text takes no row away at its end (#704). Without it, true while the last item is a reply
+    /// still waiting for its first words (that row shows the typing bubble itself).
+    private var lastIsStreamingReply: Bool {
+        guard ThreadFix.on else {
+            if case .assistant(let t, _, let streaming) = chat.items.last?.kind { return streaming && t.isEmpty }
+            return false
+        }
+        if case .assistant(_, _, let streaming) = chat.items.last?.kind { return streaming }
+        return false
+    }
+    /// Under the fix, true while the last item is a reply whose words are streaming: the status row isn't shown under it
+    /// either, for the same reason; the reply says "Writing" to VoiceOver in its place (`TranscriptRow`). Without it,
+    /// never: the status row shows as it did.
+    private var lastIsStreamingText: Bool {
+        guard ThreadFix.on else { return false }
+        if case .assistant(let t, _, true) = chat.items.last?.kind { return !t.isEmpty }
         return false
     }
     /// The tool the bot is running, for the dark typing bubble ("Running terminal…" → "terminal").
@@ -203,7 +248,7 @@ struct TranscriptView: View {
                 TimeRevealColumn {
                 ThreadStack(alignment: .leading, spacing: 10) {
                     // Not while the history is still on its way: a reopened chat showed "Say
-                    // something" for a few frames before its rows landed (Matt, 2026-10-11).
+                    // something" for a few frames before its rows landed (2026-10-11).
                     if chat.items.isEmpty, chat.resumeError == nil, !chat.isResuming {
                         VStack(spacing: 8) {
                             BotAvatar(profile: chat.profileName, size: 56)
@@ -214,7 +259,7 @@ struct TranscriptView: View {
                     threadRows
                     // Working with no bubble to fill (between parts, during a tool): the typing
                     // bubble stands on its own, dark with the badge while a tool runs.
-                    if chat.isRunning, !lastIsEmptyStreamingReply {
+                    if chat.isRunning, !lastIsStreamingReply {
                         HStack(alignment: .bottom, spacing: 10) {
                             // The working bot is pinned at the bottom-left of the thread (below);
                             // this only keeps the bubble in the bot column.
@@ -229,7 +274,8 @@ struct TranscriptView: View {
                         // (that row draws the same bubble on the same spot), and a fade or a
                         // slide there drew one bubble over the other.
                     }
-                    if let s = chat.statusLine, chat.isRunning {
+                    // Not under a reply whose words are streaming (`lastIsStreamingText`).
+                    if let s = chat.statusLine, chat.isRunning, !lastIsStreamingText {
                         HStack(spacing: 8) {
                             // The words beside it say what's under way; on its own the spinner was an element with no
                             // name and a 14-point hit area to the audit.
@@ -259,10 +305,12 @@ struct TranscriptView: View {
                 .opacity((chat.isResuming && chat.items.isEmpty) || landingOutOfSight || historyArriving ? 0 : 1)
                 .animation(.easeOut(duration: 0.25), value: chat.items.isEmpty)
                 // A reading column in the middle of the pane on a wide layout, a page wide however
-                // wide the window is; the full width on the phone.
-                .frame(maxWidth: wide ? ChatStyle.readingColumn : .infinity)
-                .onGeometryChange(for: CGFloat.self) { ($0.size.width / 20).rounded() * 20 } action: { columnWidth = $0 }
-                .frame(maxWidth: .infinity)
+                // wide the window is; the full width on the phone. One layout, not two flexible frames:
+                // the frames took the stack's height from one of its answers and placed it with a later
+                // one, so the content held a height the stack no longer had and the stack sat centred in
+                // it, cut at the end and banded at the top (#704). The column puts the stack at its top
+                // and is sized again, once, when the rows have settled (`ThreadSizing`).
+                .modifier(ThreadColumnSizing(sizing: sizing, maxWidth: columnLimit, columnWidth: $columnWidth))
                 #if os(macOS)
                 .modifier(ThreadHitGate.Gate(gate: hitGate))
                 #endif
@@ -278,6 +326,11 @@ struct TranscriptView: View {
                 // (`rowView`); what moves the thread is scrolling (`followRows`), which moves
                 // every row together.
                 .background(ScrollViewProbe(metrics: metrics, dockTop: dockTop, headerBottom: headerBottom))
+                // The content's own height and the space the rows' frames are read in, for the place keeper and the end's
+                // settle (`endSettle`).
+                .modifier(ThreadContentHeight(anchor: anchor, onChange: { endSettle($0) }))
+                // This thread's own place keeper for its rows (`ThreadRowWatch`), so two threads on screen never share one.
+                .environment(\.threadAnchor, anchor)
                 }
             }
             .scrollPosition($scrollPosition)
@@ -313,6 +366,11 @@ struct TranscriptView: View {
                                         keyboard: { keyboardMoved(to: $0) }))
             .onScrollGeometryChange(for: [CGFloat].self) { [$0.contentOffset.y, $0.contentInsets.top] } action: { _, new in
                 metrics.offsetY = new[0]; metrics.insetTop = new[1]
+                guard ThreadFix.on else { return }
+                // Each offset report is the place keeper's baseline for the rows' next moves (`ThreadAnchor.report`).
+                anchor.report(offset: new[0], metrics,
+                              hidden: (chat.isResuming && chat.items.isEmpty) || landingOutOfSight || historyArriving,
+                              items: chat.items.count)
             }
             // Your own message brings the thread to the end, as in Messages, however far up it
             // was scrolled: a tester sent one from up the thread, saw nothing happen, and had to
@@ -330,7 +388,8 @@ struct TranscriptView: View {
             // the threshold, so without it a slightly taller dock showed the arrow at the very end.
             .onScrollGeometryChange(for: ThreadGeometry.self) { g in
                 ThreadGeometry(height: g.contentSize.height, container: g.containerSize.height,
-                               distance: g.contentSize.height + g.contentInsets.bottom - g.visibleRect.maxY)
+                               distance: g.contentSize.height + g.contentInsets.bottom - g.visibleRect.maxY,
+                               offset: g.contentOffset.y)
             } action: { old, now in
                 metrics.contentHeight = now.height; metrics.containerHeight = now.container
                 metrics.distanceFromBottom = now.distance
@@ -347,12 +406,12 @@ struct TranscriptView: View {
                 // nothing until a drag bounces it back ("chats open blank until you scroll"), and
                 // content that shrinks under a thread at rest (a chat's stored rows landing shorter
                 // than its first layout) leaves an empty band over the composer that the first
-                // touch snapped away (Matt on 1.5 (21): "a weird jump"). Land it. The scroll that
+                // touch snapped away (feedback on 1.5 (21): "a weird jump"). Land it. The scroll that
                 // followed every change of the last row hid the small ones until it went with the
                 // per-token scroll.
-                if distance < -1, !metrics.userScrolling { landPastTheEnd(distance) }
-                let away = distance > 120 && !metrics.probing
-                if away != awayFromBottom { withAnimation(.snappy) { awayFromBottom = away } }
+                if distance < -1, !metrics.userScrolling { landPastTheEnd(distance, at: now.offset) }
+                // The away flags (`awayChanged`).
+                awayChanged(distance)
                 // Content growing under a locked thread also reads as "away" for a frame; only a
                 // finger on the thread unlocks it: any upward pull from where the touch began
                 // (a tester scrolling up during a reply was pulled back to the end until the
@@ -366,17 +425,44 @@ struct TranscriptView: View {
                 // thread to the bottom (#277, "you have to fight against Vory to scroll").
                 if distance < 4, !metrics.userScrolling, was < 60 { metrics.stickToBottom = true }
             }
-            .onScrollPhaseChange { _, phase in
+            .onScrollPhaseChange { was, phase in
+                guard ThreadFix.on else {
+                    // As before the fix (`ThreadFix`).
+                    // A finger on the thread counts from the touch, before it has moved.
+                    let touching = phase == .tracking || phase == .interacting || phase == .decelerating
+                    if touching, !metrics.userScrolling { metrics.touchStartDistance = metrics.distanceFromBottom }
+                    metrics.userScrolling = touching
+                    #if os(macOS)
+                    if hitGate.scrolling != touching { hitGate.scrolling = touching }
+                    #endif
+                    // Shared with the lists: idle faces hold their blink while the thread moves.
+                    BotAmbient.shared.scrolling = touching
+                    if !touching, metrics.distanceFromBottom < 4 { metrics.stickToBottom = true }
+                    return
+                }
                 // A finger on the thread counts from the touch, before it has moved.
                 let touching = phase == .tracking || phase == .interacting || phase == .decelerating
+                // A scroll a finger began comes to rest: the content is sized once more, with the rows the scroll
+                // laid (#704). Not a scroll the app asked for (those end from `.animating`), so a sizing that moves
+                // the end can never start another: the Mac's old loop of re-lay, move, scroll (`threadRows`).
+                if touching { idleSizing?.cancel(); idleSizing = nil } else if phase == .idle, was == .tracking || was == .interacting || was == .decelerating { sizeAtRest() }
+                // The place keeper's own record of the phase: a shift folds at a new finger and at rest (`ThreadAnchor`).
+                anchor.phase(was, phase)
                 if touching, !metrics.userScrolling { metrics.touchStartDistance = metrics.distanceFromBottom }
                 metrics.userScrolling = touching
+                // A finger on the thread since the lock was last set (`ScrollMetrics.lockedNoFinger`).
+                if touching { metrics.lockedNoFinger = false }
+                // Leaving an animated scroll the app asked for, the end is checked two frames on (`endSettle`).
+                if was == .animating, phase != .animating { endSettle(anchor.content, from: "anim") }
                 #if os(macOS)
                 if hitGate.scrolling != touching { hitGate.scrolling = touching }
                 #endif
                 // Shared with the lists: idle faces hold their blink while the thread moves.
                 BotAmbient.shared.scrolling = touching
                 if !touching, metrics.distanceFromBottom < 4 { metrics.stickToBottom = true }
+                // A lock set at the end of the user's own drag or its glide stays clearable by distance, as if a finger had
+                // touched since; one set at the end of the app's own scroll (`.animating`) or at rest is not.
+                if !touching, metrics.distanceFromBottom < 4, was == .tracking || was == .interacting || was == .decelerating { metrics.lockedNoFinger = false }
             }
             // The working bot: one spot at the bottom-left of the thread for the whole turn, in
             // the same pose as the bot on the header pill, gone once the turn ends. It used to sit
@@ -413,8 +499,16 @@ struct TranscriptView: View {
             }
             #endif
             .overlay(alignment: .bottomTrailing) {
-                JumpToBottomButton(visible: awayFromBottom) { jumpToBottom() }
-                .padding(.trailing, 16).padding(.bottom, dockReach + 12)
+                if ThreadFix.on {
+                    // The button reads its own flag (`awayButton`, `decideAway`); the size anchor keeps `awayFromBottom`.
+                    // Both are set with no animation, so the button carries its own.
+                    JumpToBottomButton(visible: awayButton) { jumpToBottom() }
+                    .animation(.snappy, value: awayButton)
+                    .padding(.trailing, 16).padding(.bottom, dockReach + 12)
+                } else {
+                    JumpToBottomButton(visible: awayFromBottom) { jumpToBottom() }
+                    .padding(.trailing, 16).padding(.bottom, dockReach + 12)
+                }
             }
             .sheet(item: $selectText) { SelectTextSheet(title: $0.title, text: $0.text, monospaced: $0.monospaced).sheetFrame(.wide).withAppModel() }
             .sheet(isPresented: $showModelSheet) { ModelSheet(chat: chat).sheetFrame().withAppModel() }
@@ -442,9 +536,25 @@ struct TranscriptView: View {
                 // of sight until the history has landed and the thread is at its end (#449, see `historyLanding`); a
                 // history slow to come (1.5 s), the rows it has are shown meanwhile, and its landing hides it again.
                 metrics.shownItems = chat.items.count; metrics.landings = 0; metrics.probed = false
+                if ThreadFix.on { metrics.sizedForReveal = false }
                 if chat.isResuming, rows.count < 20 { landingOutOfSight = true; capLanding(after: 1500) }
+                // A new open, under the fix (`fixOpened`).
+                fixOpened()
+                // Shown at once (rows kept from before): sized once more when it has settled, before any finger (#704).
+                if !landingOutOfSight { sizeWhenQuiet() }
+            }
+            // Insurance: a thread view handed another chat starts its place keeper afresh, so nothing of the fix is
+            // carried from one chat to the next (each chat is its own view in the app's navigation, made new).
+            .onChange(of: ObjectIdentifier(chat)) { _, _ in
+                guard ThreadFix.on else { return }
+                // A shift the old one still draws comes off the scroll view's layer first (`dropShift`).
+                anchor.dropShift()
+                anchor = ThreadAnchor()
+                anchor.opened()
             }
             .onChange(of: chat.isResuming) { _, now in
+                // The gateway's rows in, in place of the kept ones, with the thread in sight: sized once more when they settle (#704).
+                if !now, !landingOutOfSight { sizeWhenQuiet() }
                 guard !now, landingOutOfSight else { return }
                 capLanding()
                 revealIfLanded()
@@ -453,6 +563,8 @@ struct TranscriptView: View {
             // had (`ChatViewMemory`), put back once the content is laid out; at the end, nothing.
             .onDisappear { ChatViewMemory.setDistanceFromEnd(metrics.stickToBottom || metrics.distanceFromBottom < 24 ? nil : metrics.distanceFromBottom, for: chat) }
             .task { await restoreDistanceFromEnd() }
+            // The rows cross out of sight, and the content is sized again at each change of the split (`crossingLinks`).
+            .applying { crossingLinks($0) }
             // The names "@" can mean: the gateway's bots (name and label) and the person's own.
             .onChange(of: chat.runtime.profiles.map(\.name)) { _, _ in refreshMentionNames() }
             // Once the history is in and laid out, make sure the end is really on screen.
@@ -511,7 +623,8 @@ extension TranscriptView {
             OlderRows(rows: rowCache.older(than: split), context: ctx.forOlderRows(tail: all[split...])).equatable()
         }
         let entering = Self.enteringRowID(all, opening: settling || chat.isResuming)
-        ForEach(Array(all[split...])) { row in ctx.rowView(row, entering: row.id == entering) }
+        // The rows at the end, marked as never lazy for the row watch (`ThreadRowWatch` reads `threadRowInEnd`).
+        ForEach(Array(all[split...])) { row in ctx.rowView(row, entering: row.id == entering).environment(\.threadRowInEnd, true) }
     }
 
     /// The row that fades in if it is new: the last one, once the chat has opened and synced
@@ -615,6 +728,27 @@ extension TranscriptView {
         }
     }
 
+    #if os(iOS)
+    /// Puts the thread back where it was before a layout switch rebuilt it (see `ChatViewMemory`), in a view made
+    /// afresh only (`ScrollMetrics.appearedBefore`). A view that was only covered (a page pushed over it and popped)
+    /// never left its place: the distance put back on top of it moved the thread up by that much again. The stored
+    /// distance is cleared at every appear, so one stored as a covered view went never applies later.
+    private func restoreDistanceFromEnd() async {
+        let kept = metrics.appearedBefore
+        metrics.appearedBefore = true
+        if kept { ChatViewMemory.setDistanceFromEnd(nil, for: chat); return }
+        guard let d = ChatViewMemory.distanceFromEnd[ChatViewMemory.key(for: chat)], d > 24 else { return }
+        ChatViewMemory.setDistanceFromEnd(nil, for: chat)
+        // The content is laid out and the default anchor has it at the end.
+        for _ in 0..<40 {
+            if metrics.contentHeight > metrics.containerHeight, metrics.offsetY > 0 { break }
+            try? await Task.sleep(for: .milliseconds(50))
+        }
+        guard metrics.contentHeight > metrics.containerHeight else { return }
+        metrics.stickToBottom = false
+        scrollPosition.scrollTo(y: max(0, metrics.offsetY - d))
+    }
+    #else
     /// Puts the thread back where it was before a layout switch (see `ChatViewMemory`).
     private func restoreDistanceFromEnd() async {
         guard let d = ChatViewMemory.distanceFromEnd[ChatViewMemory.key(for: chat)], d > 24 else { return }
@@ -628,6 +762,174 @@ extension TranscriptView {
         metrics.stickToBottom = false
         scrollPosition.scrollTo(y: max(0, metrics.offsetY - d))
     }
+    #endif
+
+    /// The crossing out of sight (#704) and the content sized again at every change of the split. In a method of its own,
+    /// applied in place (`applying`), so the body's chain stays small enough to type-check.
+    private func crossingLinks<Chain: View>(_ chain: Chain) -> some View {
+        chain
+            // Every change of the split sizes the content again in its update, so the rows that crossed are measured
+            // before the thread is next shown.
+            .onChange(of: TranscriptRowModel.split(count: rows.count, tailFrom: tailFrom)) { old, new in splitChanged(old, new) }
+            // The thread going off screen: its chat left, another tab, a page pushed over it.
+            .onDisappear { crossOffScreen("left") }
+            #if os(macOS)
+            // The app going to the background.
+            .onChange(of: scenePhase) { was, now in
+                if now == .background { crossOffScreen("background") }
+            }
+            #else
+            // The app going to the background, from UIKit's own notification for this thread's scene.
+            .onReceive(NotificationCenter.default.publisher(for: UIScene.didEnterBackgroundNotification)) { n in
+                guard (n.object as? UIScene) === metrics.scrollView?.window?.windowScene else { return }
+                crossOffScreen("background")
+            }
+            #endif
+    }
+
+    /// A new open, under the fix (`ThreadFix`): the place keeper drops what it knew of the last one, and the plain rows
+    /// start where they reach the window's height plus the reach from the end, before the first frame is drawn
+    /// (`reachTailOpen`).
+    private func fixOpened() {
+        guard ThreadFix.on else { return }
+        anchor.opened()
+        reachTailOpen()
+    }
+
+    /// The split changed, under the fix: the content is sized again in this update.
+    private func splitChanged(_ old: Int, _ new: Int) {
+        guard ThreadFix.on else { return }
+        sizing.revision += 1
+    }
+
+    /// Under the fix (`ThreadFix`): the thread is going off screen (`left`: this view went, its chat left, another tab or
+    /// a page over it) or the app to the background (`background`): the plain rows cross into the lazy stack now, with
+    /// nothing on screen to see it. The boundary goes to the reach start (`crossTarget`), and a thread stuck to its end is
+    /// put on its end without animation in the same update. A reader up the thread (not stuck) is left as they are: the
+    /// rows they read would cross under them; the next open, or the backstop at the end, moves it.
+    private func crossOffScreen(_ why: String) {
+        guard ThreadFix.on else { return }
+        let count = rows.count
+        let from = TranscriptRowModel.split(count: count, tailFrom: tailFrom)
+        let to = crossTarget()
+        let stuck = metrics.stickToBottom
+        guard count > 0, tailFrom != nil, from != to, stuck else { return }
+        tailFrom = to
+        scrollPosition.scrollTo(edge: .bottom)
+    }
+
+    /// From `settleTail`, at an open whose rows came after `reachTailOpen`: the boundary is set at the reach start, wherever
+    /// the reader is, so no later row moves it while the chat is on screen.
+    private func setOpenBoundary() {
+        let to = crossTarget()
+        tailFrom = to
+    }
+
+    /// From `settleTail`: the backstop. When the plain rows pass `TranscriptRowModel.backstop` while the chat is on screen,
+    /// they cross as they used to: at rest (400 ms after the last change), stuck to the end, no finger, no turn running
+    /// and no card held, back to the reach start, with the thread put on its end without animation in the same update.
+    /// True when the tail is past the backstop (crossed or not), so `settleTail` does nothing more; false below it.
+    private func backstopCross() -> Bool {
+        let count = rows.count
+        let at = TranscriptRowModel.split(count: count, tailFrom: tailFrom)
+        let tail = count - at
+        guard tail > TranscriptRowModel.backstop else { return false }
+        let to = crossTarget()
+        guard !holdingCard, !chat.isRunning, metrics.stickToBottom, !metrics.userScrolling, at < to else {
+            return true
+        }
+        tailFrom = to
+        scrollPosition.scrollTo(edge: .bottom)
+        return true
+    }
+
+    /// Where the plain rows start so that, from the end, they add up to at least the window's height plus the reach
+    /// (`TranscriptRowModel.reach`): the rows a scroll up from the end reaches are laid out plain, not measured in sight
+    /// by the lazy stack. Each row's height is its last known frame (`ThreadAnchor.height(of:)`), else 71 pt. Never fewer
+    /// plain rows than `tailStart(count)`, and never inside the last turn (`lastTurnKeep`). Returns the start, the start
+    /// from the reach alone, the plain height counted, and how many heights were known.
+    private func reachStart(_ all: [TranscriptRowModel]) -> (start: Int, reach: Int, height: CGFloat, measured: Int) {
+        let need = windowGeometry.bounds.height + TranscriptRowModel.reach
+        var height: CGFloat = 0, measured = 0, i = all.count
+        while i > 0, height < need {
+            i -= 1
+            if let h = anchor.height(of: all[i].item.id), h > 0 { height += h; measured += 1 } else { height += 71 }
+        }
+        let reach = min(i, TranscriptRowModel.tailStart(all.count))
+        return (min(reach, Self.lastTurnKeep(all)), reach, height, measured)
+    }
+
+    /// Where no boundary may go past: the last turn's first row, the person's last message (`.user`, a prompt still in
+    /// flight included; a message steered into a running turn starts none). A finished turn's rows change their own size
+    /// at the next turn's start, and a lazy row that changes then sets the lazy stack re-estimating its height under the
+    /// reader (#704), so the last turn's rows stay plain. At most the backstop's rows from the end, so a longer turn's
+    /// oldest rows still cross; the count when the person has said nothing.
+    private static func lastTurnKeep(_ all: [TranscriptRowModel]) -> Int {
+        let last = all.lastIndex { if case .user = $0.item.kind { return true } else { return false } } ?? all.count
+        return max(last, all.count - TranscriptRowModel.backstop)
+    }
+
+    /// Where a crossing takes the boundary: the reach start, the last turn kept (`reachStart`).
+    private func crossTarget() -> Int { reachStart(rows).start }
+
+    /// From the thread's `onAppear`: with no boundary yet, it's set at the reach start before the first frame is drawn, so
+    /// the open lays those rows plain from the start.
+    private func reachTailOpen() {
+        guard tailFrom == nil, !rows.isEmpty else { return }
+        let r = reachStart(rows)
+        tailFrom = r.start
+    }
+
+    /// From `keyboardMoved`, before `keyboardInset` takes the new inset: true when the thread is stuck to its end, the
+    /// keyboard is going down, and either the approval card is in the dock (`chat.firstCard`, which takes the composer's
+    /// place and so the keyboard down) or the thread has no height on screen. The scroll to the end then goes at once,
+    /// without the keyboard's spring (`scrollAtOnce`).
+    private func dockHold(_ inset: CGFloat) -> Bool {
+        guard ThreadFix.on, metrics.stickToBottom, inset < keyboardInset else { return false }
+        let card = chat.firstCard != nil
+        let noHeight = metrics.containerHeight < 1
+        guard card || noHeight else { return false }
+        return true
+    }
+
+    /// The scroll to the end with no animation, in its own transaction.
+    private func scrollAtOnce() {
+        var still = Transaction()
+        still.disablesAnimations = true
+        withTransaction(still) { scrollPosition.scrollTo(edge: .bottom) }
+    }
+
+    /// The end's settle: at each change of the content's height (`c`), the check two frames later, again from the start at
+    /// each change, so it runs once the height has stopped moving; also two frames after an animated scroll the app asked
+    /// for ends (`from` `anim`, from the scroll phase handler).
+    private func endSettle(_ c: CGFloat, from: String = "height") {
+        guard ThreadFix.on else { return }
+        anchor.endSettleTask?.cancel()
+        anchor.endSettleTask = Task { @MainActor in
+            await FrameClock.next()
+            await FrameClock.next()
+            guard !Task.isCancelled else { return }
+            endSettleCheck(c, from: from)
+        }
+    }
+
+    /// UIKit's figures only. When UIKit's live offset is more than 2 pt from UIKit's own end, and the thread is stuck, no
+    /// finger, at rest, UIKit's content height equal to the content's own (`c`), and that unchanged since: the offset is
+    /// put at that end. A thread at rest at its end had stayed a few points off it after its rows settled.
+    private func endSettleCheck(_ c: CGFloat, from: String) {
+        #if os(iOS)
+        guard let sv = metrics.scrollView else { return }
+        let h = sv.contentSize.height
+        let end = h + sv.adjustedContentInset.bottom - sv.bounds.height
+        let live = sv.contentOffset.y
+        guard abs(live - end) > 2 else { return }
+        guard metrics.stickToBottom, !metrics.userScrolling, anchor.phaseNow == .idle, abs(h - c) <= 1,
+              abs(anchor.content - c) <= 0.5, end >= -sv.adjustedContentInset.top else {
+            return
+        }
+        sv.contentOffset.y = end
+        #endif
+    }
 
     private func landAfterResume() async {
         guard !chat.isResuming else { return }
@@ -635,7 +937,7 @@ extension TranscriptView {
             try? await Task.sleep(for: .milliseconds(delay))
             guard !Task.isCancelled, metrics.stickToBottom, !metrics.userScrolling else { return }
             // Eased, not snapped: a tap that moved a little on its way in nudged the thread,
-            // and the two snaps back read as a jump (Matt, 2026-10-12, "opening a chat and
+            // and the two snaps back read as a jump (2026-10-12, "opening a chat and
             // moving my finger a bit").
             if metrics.distanceFromBottom < -8 || metrics.distanceFromBottom > 8 { withAnimation(.easeOut(duration: 0.25)) { scrollPosition.scrollTo(edge: .bottom) } }
         }
@@ -655,12 +957,27 @@ extension TranscriptView {
     /// otherwise is stale (set by a frame in which the content shrank, see the geometry
     /// handler). The lock goes then, not the reader's place (#277).
     private func mayFollow() -> Bool {
+        guard ThreadFix.on else {
+            // As before the fix (`ThreadFix`); the comments are on the fix's lines below.
+            guard metrics.stickToBottom, !metrics.userScrolling else { return false }
+            let reach = max(900, metrics.containerHeight * 1.5)
+            if metrics.distanceFromBottom > reach { if !chat.isResuming { metrics.stickToBottom = false }; return false }
+            return true
+        }
         guard metrics.stickToBottom, !metrics.userScrolling else { return false }
         let reach = max(900, metrics.containerHeight * 1.5)
         // Not while the chat's history is coming in: the rows arriving under a thread that was
         // still at the top of the first ones read as a reader up the thread, with no finger on
         // it, and the end it was locked to was lost (1.5 (23), the open's blank).
-        if metrics.distanceFromBottom > reach { if !chat.isResuming { metrics.stickToBottom = false }; return false }
+        // Far from the end, the lock goes only if a finger has touched the thread since it was last set
+        // (`ScrollMetrics.lockedNoFinger`); otherwise it stays, and nothing follows (#704).
+        if metrics.distanceFromBottom > reach {
+            if metrics.lockedNoFinger {
+                return false
+            }
+            if !chat.isResuming { metrics.stickToBottom = false }
+            return false
+        }
         return true
     }
 
@@ -682,10 +999,14 @@ extension TranscriptView {
         // keyboard, and stamped as one it held off the open's own landing (1.5 (23): a chat at
         // rest went a screen past its end, blank, a moment after it opened).
         if inset != keyboardInset { keyboardMovedAt = Date() }
+        // Stuck, the keyboard going down, and the approval card in the dock or the thread at no height: the scroll to the
+        // end goes without the spring (`dockHold`). Ordinary typing keeps it.
+        let hold = dockHold(inset)
         withAnimation(.interpolatingSpring(mass: 3, stiffness: 1000, damping: 500, initialVelocity: 0)) {
             keyboardInset = inset
-            if metrics.stickToBottom { scrollPosition.scrollTo(edge: .bottom) }
+            if metrics.stickToBottom, !hold { scrollPosition.scrollTo(edge: .bottom) }
         }
+        if hold { scrollAtOnce() }
         floorTask?.cancel()
         if inset == 0 || !keyboardFloors { keyboardFloor = 0 } else {
             floorTask = Task { @MainActor in
@@ -710,6 +1031,7 @@ extension TranscriptView {
         // Landings count from the history's coming, out of sight already (opened with few rows) or not, and its rows are
         // measured once before it is shown (`probeMeasuring`).
         metrics.landings = 0; metrics.probed = false
+        if ThreadFix.on { metrics.sizedForReveal = false }
         guard !landingOutOfSight else { return }
         landingOutOfSight = true
         landingReveal?.cancel(); landingReveal = nil
@@ -780,6 +1102,16 @@ extension TranscriptView {
                     revealIfLanded()
                     return
                 }
+                // Before it is shown, under the fix (`ThreadFix`), the content is sized once more with the rows it has
+                // now (#704), still out of sight; then the same quiet frames again, so what is shown is what that sizing
+                // settled on.
+                if ThreadFix.on, !metrics.sizedForReveal {
+                    metrics.sizedForReveal = true
+                    sizing.revision += 1
+                    landingReveal = nil
+                    revealIfLanded()
+                    return
+                }
                 reveal(metrics.landings > 0 ? "landing" : "frames")
             }
         } else {
@@ -824,8 +1156,15 @@ extension TranscriptView {
         else { withAnimation(.easeOut(duration: 0.28)) { scrollPosition.scrollTo(edge: .bottom) } }
     }
 
-    /// Hands the older rows of the thread's end to the lazy stack once the thread has been
-    /// still for a moment, and only while it rests at its end: the rows that cross are above
+    /// The rows of the thread's end cross into the lazy stack only out of sight (#704): rows crossing in sight were laid out
+    /// from the lazy stack's guesses, and the thread moved under the reader. So, 400 ms after the last change of the rows or
+    /// the turn: at the open, the boundary is set where the rows already split, with nothing moving, if `reachTailOpen` had
+    /// no rows to set it from; past the backstop, the rows cross as they did before (`backstopCross`); otherwise nothing
+    /// crosses while the chat is on screen, and the boundary moves when the thread goes off screen (`crossOffScreen`) or at
+    /// the next open. A boundary past the rows' own (rows taken away) comes back to them, with nothing crossing.
+    ///
+    /// Without the fix (`ThreadFix`), as before: hands the older rows of the thread's end to the lazy stack once the
+    /// thread has been still for a moment, and only while it rests at its end: the rows that cross are above
     /// the screen then, and the thread is put back on its end in the same pass, so nothing
     /// shows. Not while the reader is up the thread, where the rows on screen would shift, and
     /// not while a turn runs: a tool call taking a moment looked like rest, and the rows that
@@ -835,17 +1174,29 @@ extension TranscriptView {
     private func settleTail() async {
         try? await Task.sleep(for: .milliseconds(400))
         guard !Task.isCancelled else { return }
+        guard ThreadFix.on else {
+            let count = rows.count
+            let wanted = TranscriptRowModel.tailStart(count)
+            // Not set yet while a turn runs: set where the rows already split, wherever the reader
+            // is (nothing moves), so the rest of the turn holds its rows out of the lazy stack.
+            // Unset, the boundary followed every block of new rows, a reader up the thread or not.
+            if tailFrom == nil, chat.isRunning, count > 0 { tailFrom = wanted; return }
+            guard metrics.stickToBottom, !metrics.userScrolling, tailFrom != wanted else { return }
+            let moves = TranscriptRowModel.split(count: count, tailFrom: tailFrom) != wanted
+            if moves, chat.isRunning { return }
+            tailFrom = wanted
+            if moves { scrollPosition.scrollTo(edge: .bottom) }
+            return
+        }
+        if tailFrom == nil, !rows.isEmpty { setOpenBoundary(); return }
+        if backstopCross() { return }
         let count = rows.count
         let wanted = TranscriptRowModel.tailStart(count)
-        // Not set yet while a turn runs: set where the rows already split, wherever the reader
-        // is (nothing moves), so the rest of the turn holds its rows out of the lazy stack.
-        // Unset, the boundary followed every block of new rows, a reader up the thread or not.
-        if tailFrom == nil, chat.isRunning, count > 0 { tailFrom = wanted; return }
         guard metrics.stickToBottom, !metrics.userScrolling, tailFrom != wanted else { return }
-        let moves = TranscriptRowModel.split(count: count, tailFrom: tailFrom) != wanted
-        if moves, chat.isRunning { return }
+        guard TranscriptRowModel.split(count: count, tailFrom: tailFrom) == wanted else {
+            return
+        }
         tailFrom = wanted
-        if moves { scrollPosition.scrollTo(edge: .bottom) }
     }
 
     /// The thread came to rest past its end with no finger on it (not tracking, dragging or
@@ -854,7 +1205,7 @@ extension TranscriptView {
     /// against the dock with no frame of gap or of blank; a large one with the thread not
     /// following after a moment, once its rows have laid out, eased; either waits while the
     /// keyboard's spring is carrying the thread, and none meets an eased landing under way.
-    private func landPastTheEnd(_ distance: CGFloat) {
+    private func landPastTheEnd(_ distance: CGFloat, at offset: CGFloat? = nil) {
         guard Date() > overscrollEaseUntil, !CardHold.shared.holding else { return }
         // Locked, any size, once there is more thread than screen (a chat still empty or shorter
         // than the screen reads as past its end until its rows come, and is no landing).
@@ -865,12 +1216,80 @@ extension TranscriptView {
         var still = Transaction()
         still.disablesAnimations = true
         withTransaction(still) { scrollPosition.scrollTo(edge: .bottom) }
+        // In the update that changed the content's height, UIKit still has the old height, and the scroll above lands
+        // against it: it moves nothing, and the thread was drawn past its end for a frame (a tool turn's rows folding as
+        // the next prompt went out, a 570 pt flash and back) until the next reading landed it. Locked to the end before
+        // this change (`locked` is read before this reading's own lock below it), the end is set in UIKit at once, in
+        // this same update, from this reading's own offset and distance (`LandBeforeCommit.now`), so the commit that
+        // carries the change carries the landing; and checked again just before the next commit against UIKit's own end
+        // (`LandBeforeCommit.ask`).
+        #if os(iOS)
+        if ThreadFix.on, locked, let sv = metrics.scrollView, abs(sv.contentSize.height - metrics.contentHeight) >= 0.5 {
+            if let offset { LandBeforeCommit.now(sv, metrics, anchor, end: offset + distance, from: offset) }
+            LandBeforeCommit.ask(sv, metrics, anchor) {
+                if Date() <= overscrollEaseUntil { return "eased" }
+                if CardHold.shared.holding { return "card" }
+                if Date().timeIntervalSince(keyboardMovedAt) <= 0.6 { return "keyboard" }
+                return nil
+            }
+        }
+        #endif
+    }
+
+    /// The away flags after the distance changed. Under the fix (`ThreadFix`), decided once a run-loop turn, just before
+    /// Core Animation's commit, on the distance as drawn then, after every move of that turn (`decideAway`). Without it,
+    /// as before: the one flag at once, with the animation.
+    private func awayChanged(_ distance: CGFloat) {
+        guard ThreadFix.on else {
+            let away = distance > 120 && !metrics.probing
+            if away != awayFromBottom { withAnimation(.snappy) { awayFromBottom = away } }
+            return
+        }
+        anchor.askAway { decideAway() }
+    }
+
+    /// The away flags, decided once a run-loop turn just before Core Animation's commit (`ThreadAnchor.askAway`), on the
+    /// distance as drawn then, after every move of that turn (#704). The reported distance is corrected by how far the
+    /// scroll view's offset has moved since it was reported (a fold, a fix or a re-set earlier in the turn moves it before
+    /// the next report), and less the place keeper's shift, so the shift and the offset are read as of the same moment and
+    /// a creep the shift hides doesn't bring the button in. Two flags from that one distance: the size-change anchor's
+    /// (`awayFromBottom`) on the plain rule, so a reply streaming at the end is followed; the button's (`awayButton`) with
+    /// hysteresis (on above 120; off below 60, or below 24 under a finger), so it doesn't flicker. Both are set with no
+    /// animation, so no layout change landing in the same update is eased; the button keeps its own.
+    private func decideAway() {
+        #if os(iOS)
+        let live = metrics.scrollView?.contentOffset.y ?? metrics.offsetY
+        #else
+        let live = metrics.offsetY
+        #endif
+        let d = metrics.distanceFromBottom - (live - metrics.offsetY) - anchor.shiftNow
+        var anchorWant = !metrics.probing && d > 120
+        // Stuck to the end with no finger on the thread (only the user's own scroll unsticks it), a content change alone
+        // can't turn the size anchor's flag on.
+        let guarded = anchorWant && !awayFromBottom && metrics.stickToBottom && !metrics.userScrolling
+        if guarded { anchorWant = false }
+        if anchorWant != awayFromBottom {
+            var still = Transaction()
+            still.disablesAnimations = true
+            withTransaction(still) { awayFromBottom = anchorWant }
+        }
+        let on = awayButton
+        let want: Bool
+        if metrics.probing { want = false }
+        else if !on { want = d > 120 }
+        else if metrics.userScrolling { want = !(d < 24) }
+        else { want = !(d < 60) }
+        if want != on {
+            var still = Transaction()
+            still.disablesAnimations = true
+            withTransaction(still) { awayButton = want }
+        }
     }
 
     /// The lazy stack measures its rows only as a scroll brings them near, and until then a long history's height is its
     /// estimate (40,494 pt for a chat that settles at 19,282). Shown at its end over that, nothing moves while it rests (the
     /// anchor holds the end), but the first scroll measures it: in a pull past the end the scroll view kept its offset while
-    /// the content shrank under the finger, 4,404 pt past the end in sight, then snapped back in a frame (#468; Matt's
+    /// the content shrank under the finger, 4,404 pt past the end in sight, then snapped back in a frame (#468; the reported
     /// "stutters instead of rubber-banding" right after opening). So out of sight, at its end and quiet, the thread is
     /// scrolled up and, a frame later, landed back at its end, in rounds. The lazy stack measures a step with each scroll
     /// that moves the view, and the scroll's layout runs in its own turn, so the next frame has it. One round took a long
@@ -901,11 +1320,79 @@ extension TranscriptView {
             }
             metrics.probing = false; metrics.probeTask = nil
             guard landingOutOfSight else { return }
+            // Under the fix (`ThreadFix`), the rows the rounds measured, in one sizing of the content before the last
+            // landing (#704).
+            if ThreadFix.on {
+                sizing.revision += 1
+                await FrameClock.next()
+                guard !Task.isCancelled, landingOutOfSight else { return }
+            }
             noteLanding()
             withTransaction(still) { scrollPosition.scrollTo(edge: .bottom) }
             revealIfLanded()
         }
     }
+
+    /// A finger's scroll at rest (#704), under the fix (`ThreadFix`): the content is sized once more after two frames of
+    /// real rest, so a finger that comes down again at once (a fling after a fling) is never under a sizing. A touch
+    /// meanwhile cancels it.
+    private func sizeAtRest() {
+        guard ThreadFix.on else { return }
+        idleSizing?.cancel()
+        idleSizing = Task { @MainActor in
+            await FrameClock.next()
+            await FrameClock.next()
+            guard !Task.isCancelled, !metrics.userScrolling else { return }
+            sizing.revision += 1
+            idleSizing = nil
+        }
+    }
+
+    /// A thread in sight with no finger on it, at its open (rows kept from before) or when the gateway's rows have
+    /// replaced the kept ones (#704): the content is sized once more as soon as its height has held for two frames,
+    /// so the scroll view's height is the content's before any first touch. Neither end moves: at the end the bottom
+    /// anchor holds the end; up the thread the stack sits at the content's top, so a height that changes does so
+    /// under the window, not above it. A touch first cancels it (`idleSizing`); the scroll's own rest sizes then. Under
+    /// the fix (`ThreadFix`) only.
+    private func sizeWhenQuiet() {
+        guard ThreadFix.on else { return }
+        idleSizing?.cancel()
+        idleSizing = Task { @MainActor in
+            var last = metrics.contentHeight, same = 0
+            // Sixty frames at most (half a second to a second): a thread that never holds still is left to its rest.
+            for _ in 0..<60 {
+                await FrameClock.next()
+                guard !Task.isCancelled else { return }
+                if metrics.contentHeight == last { same += 1 } else { same = 0; last = metrics.contentHeight }
+                if same >= 2 { break }
+            }
+            guard !Task.isCancelled, !metrics.userScrolling, !landingOutOfSight else { return }
+            sizing.revision += 1
+            #if os(iOS)
+            figuresFromUIKit()
+            #endif
+            idleSizing = nil
+        }
+    }
+    #if os(iOS)
+    /// After the quiet sizing (`sizeWhenQuiet`): a sizing that changed nothing leaves SwiftUI's scroll geometry with
+    /// nothing to report, and its last report can stand short of where UIKit has the thread. When UIKit's height or
+    /// offset is more than half a point from the reported ones (`ScrollTruth.distance`), the thread's figures take
+    /// UIKit's, the distance by the end's settle's sum, and the away flags are decided again on them. Writing the
+    /// figures lays out and draws nothing, as they are not observed; only a change of the away flags, decided again
+    /// here, can show.
+    private func figuresFromUIKit() {
+        guard let sv = metrics.scrollView,
+              let d = ScrollTruth.distance(height: sv.contentSize.height, offset: sv.contentOffset.y,
+                                           bottomInset: sv.adjustedContentInset.bottom, boundsHeight: sv.bounds.height,
+                                           reportedHeight: metrics.contentHeight, reportedOffset: metrics.offsetY)
+        else { return }
+        metrics.contentHeight = sv.contentSize.height
+        metrics.offsetY = sv.contentOffset.y
+        metrics.distanceFromBottom = d
+        decideAway()
+    }
+    #endif
 
     /// A landing past the end while the thread is out of sight: the reveal waits for one that sticks (`revealIfLanded`).
     private func noteLanding() {
@@ -1126,6 +1613,8 @@ struct RowContext: Equatable {
             // rebuilt when the thread re-evaluates for a scroll or a token.
             .equatable()
             .id(id)
+            // The row's height and frame, for the reach and the thread's place keeper (`ThreadRowWatch`).
+            .modifier(ThreadRowWatch(id: id))
             // One element per message, by kind: a group for VoiceOver, and what the UI tests
             // compare frame by frame to check that no row is ever drawn over another.
             .accessibilityElement(children: .contain)
@@ -1219,6 +1708,81 @@ private struct ScrollViewProbe: UIViewRepresentable {
 }
 #endif
 
+/// When the thread's content is sized again (#704): a number moved on at the few moments the rows have settled (a
+/// landed history before it is shown, the end of the measuring scroll, a finger's scroll at rest), never per frame.
+/// Observable on its own, as `ThreadHitGate` is, so only the column's modifier reads it: a sizing doesn't run the
+/// thread's body.
+@Observable final class ThreadSizing {
+    var revision = 0
+}
+
+/// The thread's stack in its reading column (#704), with the column's width handed to the thread for the bubbles'
+/// share of it (`columnWidth`, read here from the width the layout gives, never from what the stack answers: the
+/// bubbles' cap comes from it, and a reader on the stack's own answer could feed back into it).
+private struct ThreadColumnSizing: ViewModifier {
+    let sizing: ThreadSizing
+    let maxWidth: CGFloat
+    @Binding var columnWidth: CGFloat
+    func body(content: Content) -> some View {
+        if ThreadFix.on {
+            ThreadColumn(maxWidth: maxWidth, revision: sizing.revision) { content }
+                .onGeometryChange(for: CGFloat.self) { (min($0.size.width, maxWidth) / 20).rounded() * 20 } action: { columnWidth = $0 }
+        } else {
+            // As before the fix (`ThreadFix`): the two flexible frames, `maxWidth` being the reading column on a wide
+            // layout and the full width on the phone.
+            content
+                .frame(maxWidth: maxWidth)
+                .onGeometryChange(for: CGFloat.self) { ($0.size.width / 20).rounded() * 20 } action: { columnWidth = $0 }
+                .frame(maxWidth: .infinity)
+        }
+    }
+}
+
+/// One child, the thread's stack: given the column's width (the whole width up to `maxWidth`), centred across the
+/// pane, and placed at its top edge, never centred down it, so a height that moves can only show at the end. Its size
+/// is the stack's height from one answer, the same pass that places it. `revision` is part of the layout's value, so
+/// a change of it lays the column out again and asks the stack once more.
+private struct ThreadColumn: Layout {
+    var maxWidth: CGFloat
+    var revision: Int
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        guard let child = subviews.first else { return .zero }
+        let full = proposal.width ?? child.sizeThatFits(.unspecified).width
+        let height = child.sizeThatFits(ProposedViewSize(width: min(full, maxWidth), height: nil)).height
+        return CGSize(width: full, height: height)
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        guard let child = subviews.first else { return }
+        child.place(at: CGPoint(x: bounds.midX, y: bounds.minY), anchor: .top,
+                    proposal: ProposedViewSize(width: min(bounds.width, maxWidth), height: nil))
+    }
+}
+
+#if os(iOS)
+/// The thread's distance from its end by UIKit's own figures (`TranscriptView.figuresFromUIKit`): nil when UIKit's
+/// height and offset are both within half a point of the thread's figures as last set (SwiftUI's report, or UIKit's
+/// after an earlier write), so nothing is written; else the content's height plus the bottom inset, less the scroll
+/// view's height and the offset, the sum the end's settle reads (`endSettleCheck`).
+enum ScrollTruth {
+    static func distance(height: CGFloat, offset: CGFloat, bottomInset: CGFloat, boundsHeight: CGFloat,
+                         reportedHeight: CGFloat, reportedOffset: CGFloat) -> CGFloat? {
+        guard abs(height - reportedHeight) > 0.5 || abs(offset - reportedOffset) > 0.5 else { return nil }
+        return height + bottomInset - boundsHeight - offset
+    }
+}
+
+/// The width a thread's column may take in its window (`TranscriptView.columnLimit`): the window's width less its side
+/// insets (the closed iPhone Duo's side strip), or no limit while the window has no width to give.
+enum SafeColumn {
+    static func width(window: CGFloat, leading: CGFloat, trailing: CGFloat) -> CGFloat {
+        let width = window - max(0, leading) - max(0, trailing)
+        return window > 0 && width > 0 ? width : .infinity
+    }
+}
+#endif
+
 /// The figures a scroll changes every frame. Not observable on purpose (see `TranscriptView.metrics`).
 /// The thread's scroll geometry as one reading (#453): its content height, its window's height, and how far its end is
 /// below the window's bottom, insets included.
@@ -1226,6 +1790,15 @@ struct ThreadGeometry: Equatable {
     var height: CGFloat
     var container: CGFloat
     var distance: CGFloat
+    /// The offset the distance was read at, for the past-end landing in the same update (`LandBeforeCommit.now`).
+    var offset: CGFloat
+
+    /// Equal on the height, the window's height and the distance only, as before the offset was carried: a reading whose
+    /// offset alone moved (the bottom inset and the offset moving in step, as at the dock's settle) is no change, so the
+    /// action runs exactly when it did, on both platforms. The offset rides along on the readings that are.
+    static func == (a: ThreadGeometry, b: ThreadGeometry) -> Bool {
+        a.height == b.height && a.container == b.container && a.distance == b.distance
+    }
 }
 
 final class ScrollMetrics {
@@ -1236,7 +1809,11 @@ final class ScrollMetrics {
     #endif
     /// Locked to the bottom: the thread follows every new token, tool call and card. Only the
     /// user's own drag releases it; the jump button (or scrolling back down) locks it again.
-    var stickToBottom = true
+    /// Under the fix (`ThreadFix`), each time the lock is set true (any of its places), it starts again with no finger
+    /// since (`lockedNoFinger`); the scroll phase handler clears that when a finger is on the thread.
+    var stickToBottom = true { didSet { if ThreadFix.on, stickToBottom { lockedNoFinger = true } } }
+    /// The lock was set true and no finger has been on the thread since, so `mayFollow` keeps it however far the end is.
+    var lockedNoFinger = true
     var userScrolling = false
     var distanceFromBottom: CGFloat = 0
     /// How far from the end the thread was when the current touch began.
@@ -1248,6 +1825,14 @@ final class ScrollMetrics {
     /// The scroll view's top inset (the header's room), with `offsetY`: a scroll to an offset goes to `offsetY` plus it,
     /// as `ScrollPosition.scrollTo(y:)` counts from the content's top under the inset, not from the scroll view's edge.
     var insetTop: CGFloat = 0
+    #if os(iOS)
+    /// The thread view has appeared before: a page was pushed over it and popped. It kept its place, so the distance
+    /// from the end it stored as it went (`ChatViewMemory`) is not put back. A view made afresh (a layout switch, the
+    /// chat opened again from the list) starts without it, as these figures are the view's own
+    /// (`TranscriptView.restoreDistanceFromEnd`). Here, not in view state, so setting it at each open doesn't evaluate
+    /// the thread's body again.
+    var appearedBefore = false
+    #endif
     /// The thread's landings past its end while out of sight since its history came, and the height at the last one
     /// (#453, `revealIfLanded`).
     var landings = 0
@@ -1255,6 +1840,8 @@ final class ScrollMetrics {
     /// The out-of-sight scroll that makes the lazy stack measure a history before it is shown (#468, `probeMeasuring`):
     /// done once per history, under way, and its task.
     var probed = false
+    /// The content sized once more before a landed history is shown (#704, `revealIfLanded`): once per history.
+    var sizedForReveal = false
     var probing = false
     var probeTask: Task<Void, Never>?
     /// The chat's item count when the thread was last shown (or opened): a history arriving under it hides the thread in
@@ -1526,22 +2113,42 @@ struct TranscriptRowModel: Identifiable, Equatable {
 
     static let gap: TimeInterval = 15 * 60
 
-    /// Rows the end of the thread keeps out of the lazy stack, at least: enough to fill the
+    /// Rows the end of the thread keeps out of the lazy stack, at least, under the fix (`ThreadFix`).
+    static let tailRows = 13
+    /// The most rows the end of the thread holds while the chat is on screen, under the fix: past it, they cross at rest
+    /// at the end (`settleTail`), as many as leave the reach (`reachStart`).
+    static let backstop = 96
+    /// How much plain height the end keeps above the window's top, under the fix: the reach in which a change of the dock
+    /// or the keyboard has SwiftUI lay rows, so no lazy row is re-measured by it.
+    static let reach: CGFloat = 1400
+    /// Without the fix (the Mac): rows the end of the thread keeps out of the lazy stack, at least: enough to fill the
     /// screen, so a thread at its end shows no lazy row.
     static let tailBlock = 16
-    /// The most rows the end of the thread holds before the lazy stack takes some regardless.
+    /// Without the fix: the most rows the end of the thread holds before the lazy stack takes some regardless.
     /// Room for a long turn of tool calls (one can add dozens of rows), whose rows would
     /// otherwise cross while it streams (see `settleTail`).
     static let tailCap = 96
-    /// Rows the end keeps when it outgrows `tailCap`: a few screens' worth, so the rows that
+    /// Without the fix: rows the end keeps when it outgrows `tailCap`: a few screens' worth, so the rows that
     /// cross then are far above the screen.
     static let tailKeep = 48
-    /// Where the rows that are not lazy would start if nothing held them, `keep` rows (or up to
+    /// Where the rows that are not lazy would start if nothing held them. Under the fix, exactly `tailRows` rows from the
+    /// end; the thread's own boundary sits at or above it, where the plain rows cover the window and the reach
+    /// (`reachStart`). Without it, whole blocks (`blockStart`).
+    static func tailStart(_ count: Int) -> Int {
+        guard ThreadFix.on else { return blockStart(count) }
+        return max(0, count - tailRows)
+    }
+    /// Without the fix: where the rows that are not lazy would start, `keep` rows (or up to
     /// a block more) from the end: whole blocks, so the boundary moves once in a block of rows.
-    static func tailStart(_ count: Int, keep: Int = tailBlock) -> Int {
+    static func blockStart(_ count: Int, keep: Int = tailBlock) -> Int {
         max(0, (count - keep) / tailBlock * tailBlock)
     }
-    /// Index of the first row that is not lazy. The thread's own boundary (`tailFrom`) stands
+    /// Index of the first row that is not lazy. Under the fix, the thread's own boundary (`tailFrom`) stands while it
+    /// leaves at least the default tail; a thread that has not set one starts at `tailStart`. While the chat is on screen
+    /// the boundary never moves: it moves when the chat goes off screen, at the next open, and at the backstop
+    /// (`settleTail`), so rows never cross into the lazy stack under the reader's eyes.
+    ///
+    /// Without it: the thread's own boundary (`tailFrom`) stands
     /// while it leaves a sensible end: a thread that has not set one goes by whole blocks. Past
     /// `tailCap` rows (a turn longer than the end holds, a history that arrived or rows that
     /// piled up while the reader was up the thread) only the rows a few screens up cross: a
@@ -1549,10 +2156,15 @@ struct TranscriptRowModel: Identifiable, Equatable {
     /// mid-turn, which laid the newest rows out from its guessed heights, over a long reply
     /// (#410). The rest cross at rest (`settleTail`).
     static func split(count: Int, tailFrom: Int?) -> Int {
+        guard ThreadFix.on else {
+            let wanted = tailStart(count)
+            guard let tailFrom, tailFrom <= wanted else { return wanted }
+            if count - tailFrom <= tailCap { return tailFrom }
+            return max(tailFrom, blockStart(count, keep: tailKeep))
+        }
         let wanted = tailStart(count)
         guard let tailFrom, tailFrom <= wanted else { return wanted }
-        if count - tailFrom <= tailCap { return tailFrom }
-        return max(tailFrom, tailStart(count, keep: tailKeep))
+        return tailFrom
     }
 
     static func build(_ items: [TranscriptItem], now: Date = Date()) -> [TranscriptRowModel] {
@@ -1837,6 +2449,18 @@ struct TranscriptRow: View, Equatable {
                     Button { onSelectText(text) } label: { Label("Select Text", systemImage: "selection.pin.in.out") }
                     ShareLink(item: text) { Label("Share", systemImage: "square.and.arrow.up") }
                 }
+                // With no status row under a streaming reply (`TranscriptView.lastIsStreamingText`, under `ThreadFix`), the
+                // reply itself says it's being written: one element after its words, "Writing", that updates often. An
+                // overlay of one point, so it takes no room and moves nothing; it goes when the reply stops streaming.
+                .overlay(alignment: .bottomLeading) {
+                    if ThreadFix.on, streaming {
+                        Color.clear.frame(width: 1, height: 1)
+                            .accessibilityElement()
+                            .accessibilityLabel("Writing")
+                            .accessibilityAddTraits(.updatesFrequently)
+                            .accessibilityIdentifier("thread.writing")
+                    }
+                }
                 #if os(macOS)
                 // Copy on hover, beside the bubble's trailing edge (#255, #402); not while it streams.
                 .modifier(ReplyCopyHover(text: text, enabled: !streaming, onSelectText: { onSelectText(text) }))
@@ -2011,7 +2635,7 @@ struct InjectedNoteRow: View {
         // One piece of glass that grows out from its centre both ways and folds back the same
         // way. The title never moves: it stays centred, and the details are laid out at the
         // row's full width underneath from the start, so the widening glass reveals them
-        // (Matt, 2026-10-11: "stay centered and it expands on both sides to reveal the text").
+        // (2026-10-11: "stay centered and it expands on both sides to reveal the text").
         let open = open
         let title = HStack(spacing: 6) {
             Image(systemName: note.title.contains("failed") ? "exclamationmark.circle" : note.title.hasPrefix("Scheduled") ? "clock" : note.title.hasPrefix("Subagent") ? "person.2" : "gearshape.2")
@@ -2312,6 +2936,863 @@ struct ThreadGeometryWatch: ViewModifier {
     }
 }
 #endif
+
+/// Where the thread's fix for rows that jump runs (#704): the iPhone and iPad, where it was measured. The Mac keeps the
+/// thread's behavior from before it, until the fix is measured there. Each part of the fix reads this at its own entry,
+/// with the earlier behavior as the other branch.
+enum ThreadFix {
+    static let on: Bool = {
+        #if os(iOS)
+        return true
+        #else
+        return false
+        #endif
+    }()
+}
+
+#if os(iOS)
+/// The past-end landing's second half (#704). The landing (`TranscriptView.landPastTheEnd`) scrolls to the end in the update
+/// that found the thread past it. When that update also changed the content's height, UIKit still has the old height, the
+/// scroll moves nothing, and the thread was drawn past its end for a frame.
+///
+/// `now`, in that same update: UIKit's offset is set to the end the reading itself gives (its offset plus its distance),
+/// as the place keeper's own fixes are set from a row's reading, so the commit that carries the change carries the
+/// landing. Only when UIKit's offset is still the one the reading was taken at (`offsets`), and only toward the end
+/// (`landed`). The observer below can come after that commit: in a tool turn's fold it came 14 ms later, with a frame
+/// drawn between.
+///
+/// `ask`, once a turn per scroll view (the latest ask kept): just before the next commit (order 1,997,000, ahead of the
+/// away decision's), UIKit's own end is read and the offset set to it if it's past it, or, after a set by `now`, short of
+/// it (`now` used a height UIKit then didn't take). Unless by then:
+/// - the thread is at its end already (`landed`);
+/// - the lock is off (`unstuck`): a reader who scrolled up is never moved;
+/// - a finger is on the thread or its glide runs (`finger`), or the scroll is in any phase but idle or `.animating`
+///   (`phase`). In `.animating` it lands where that scroll is going: every animated scroll the app asks for is to the
+///   end, and the landing a frame later ends that scroll too;
+/// - the view says no (`eased`, the landing's own eased landing under way; `card`, a card held; `keyboard`, the
+///   keyboard's spring);
+/// - the place keeper holds the offset (`ThreadAnchor.holdsForLanding`).
+@MainActor
+enum LandBeforeCommit {
+    private struct Due {
+        weak var sv: UIScrollView?
+        let metrics: ScrollMetrics
+        let anchor: ThreadAnchor
+        let viewWhy: @MainActor () -> String?
+    }
+    private static var due: [ObjectIdentifier: Due] = [:]
+    /// Where `now` set the offset this turn, by scroll view, for the check at the commit.
+    private static var early: [ObjectIdentifier: CGFloat] = [:]
+
+    /// In the update that found the thread past its end (see the type's comment). `end` and `from` are the reading's own.
+    static func now(_ sv: UIScrollView, _ metrics: ScrollMetrics, _ anchor: ThreadAnchor, end: CGFloat, from: CGFloat) {
+        let live = sv.contentOffset.y
+        let target = max(-sv.adjustedContentInset.top, end)
+        let phase = anchor.phaseNow
+        let why: String?
+        if abs(live - from) >= 0.5 { why = "offsets" }
+        else if target >= live - 1 { why = "landed" }
+        else if metrics.userScrolling { why = "finger" }
+        else if phase != .idle, phase != .animating { why = "phase" }
+        else { why = anchor.holdsForLanding }
+        if why == nil {
+            sv.setContentOffset(CGPoint(x: sv.contentOffset.x, y: target), animated: false)
+            early[ObjectIdentifier(sv)] = target
+        }
+    }
+
+    static func ask(_ sv: UIScrollView, _ metrics: ScrollMetrics, _ anchor: ThreadAnchor, viewWhy: @escaping @MainActor () -> String?) {
+        let key = ObjectIdentifier(sv)
+        let first = due[key] == nil
+        due[key] = Due(sv: sv, metrics: metrics, anchor: anchor, viewWhy: viewWhy)
+        guard first else { return }
+        let once = CFRunLoopObserverCreateWithHandler(kCFAllocatorDefault, CFRunLoopActivity.beforeWaiting.rawValue, false, 1_997_000) { _, _ in
+            MainActor.assumeIsolated { run(key) }
+        }
+        CFRunLoopAddObserver(CFRunLoopGetMain(), once, .commonModes)
+    }
+
+    private static func run(_ key: ObjectIdentifier) {
+        let set = early.removeValue(forKey: key)
+        guard let d = due.removeValue(forKey: key), let sv = d.sv else { return }
+        let ins = sv.adjustedContentInset
+        let from = sv.contentOffset.y
+        let end = max(-ins.top, sv.contentSize.height + ins.bottom - sv.bounds.height)
+        let phase = d.anchor.phaseNow
+        let why: String?
+        // Past the end: landed. Short of it: only after a set by `now` this turn, whose height UIKit didn't take.
+        if from <= end + 1, set == nil || from >= end - 1 { why = "landed" }
+        else if !d.metrics.stickToBottom { why = "unstuck" }
+        else if d.metrics.userScrolling { why = "finger" }
+        else if phase != .idle, phase != .animating { why = "phase" }
+        else if let v = d.viewWhy() { why = v }
+        else { why = d.anchor.holdsForLanding }
+        if why == nil { sv.setContentOffset(CGPoint(x: sv.contentOffset.x, y: end), animated: false) }
+    }
+}
+#endif
+
+/// Applies a view's own method to the chain so far, in place in a modifier chain (`.applying { crossingLinks($0) }`), so a
+/// run of links can live in a method of their own and the chain stays small enough to type-check.
+extension View {
+    func applying<Result: View>(_ links: (Self) -> Result) -> Result { links(self) }
+}
+
+/// The thread's content: the space its rows' frames are read in (`ThreadAnchor.space`), and its height, kept by the place
+/// keeper at each change (for the edges and the end's settle) and passed on (`TranscriptView.endSettle`).
+struct ThreadContentHeight: ViewModifier {
+    let anchor: ThreadAnchor
+    let onChange: (CGFloat) -> Void
+    func body(content: Content) -> some View {
+        if ThreadFix.on { watched(content) } else { content }
+    }
+    private func watched(_ content: Content) -> some View {
+        content
+            .coordinateSpace(.named(ThreadAnchor.space))
+            .onGeometryChange(for: CGFloat.self) { ($0.size.height * 100).rounded() / 100 } action: { old, new in
+                anchor.content = new
+                guard old != new else { return }
+                onChange(new)
+            }
+            // The first height too, which the reader above does not report.
+            .background {
+                GeometryReader { g in
+                    let _ = anchor.noteContent(g.size.height)
+                    Color.clear
+                }
+            }
+    }
+}
+
+/// A row, told to its thread's place keeper, under the fix (`ThreadFix`); otherwise the row is passed through.
+/// - **Its height, for the reach** (`ThreadAnchor.height(of:)`): from its frame in the window, which changes whenever the
+///   thread moves, so every laid row reports its height from its first layout on, and drops it when it goes.
+/// - **Its frame in the thread's content** (`ThreadAnchor.space`): that frame changes only when
+///   the layout moves the row in the content (a row above it measured or changed height), never in a plain scroll, so
+///   that action runs only then. A lazy row also says when it appears, when it goes and when it is first laid out: a
+///   shift is answered in what is drawn only while no lazy row is on screen, and a lazy row's first layout ends the creep
+///   the shift was answering.
+struct ThreadRowWatch: ViewModifier {
+    let id: String
+    @Environment(\.threadAnchor) private var anchor
+    @Environment(\.threadRowInEnd) private var inEnd
+    func body(content: Content) -> some View {
+        if let anchor, ThreadFix.on {
+            content
+                .onGeometryChange(for: CGRect.self) { $0.frame(in: .global) } action: { frame in
+                    anchor.noteHeight(id, frame.height)
+                }
+                .onGeometryChange(for: CGRect.self) { $0.frame(in: .named(ThreadAnchor.space)) } action: { old, new in
+                    anchor.moved(id, from: old, to: new)
+                }
+                .background {
+                    if !inEnd {
+                        GeometryReader { _ in
+                            let _ = anchor.lazyLaid(id)
+                            Color.clear
+                        }
+                    }
+                }
+                .onAppear { if !inEnd { anchor.lazyAppeared(id) } }
+                .onDisappear {
+                    anchor.forget(id)
+                    if !inEnd { anchor.lazyGone(id) }
+                }
+        } else {
+            content
+        }
+    }
+}
+
+/// The thread's place keeper, for its rows (`ThreadRowWatch`); none outside a thread.
+private struct ThreadAnchorKey: EnvironmentKey { static let defaultValue: ThreadAnchor? = nil }
+/// Whether a row is one of the thread's end (never lazy): set on the end's rows only (`threadRows`).
+private struct ThreadRowInEndKey: EnvironmentKey { static let defaultValue = false }
+extension EnvironmentValues {
+    var threadAnchor: ThreadAnchor? {
+        get { self[ThreadAnchorKey.self] }
+        set { self[ThreadAnchorKey.self] = newValue }
+    }
+    var threadRowInEnd: Bool {
+        get { self[ThreadRowInEndKey.self] }
+        set { self[ThreadRowInEndKey.self] = newValue }
+    }
+}
+
+/// One thread's place keeper (#704): what the thread needs to keep its rows where the reader left them while the
+/// content above them is measured, and to keep its end while it rests there. One per thread view, made with the view and
+/// handed to its rows through the environment, so two threads on screen (the Mac, the iPad) never share it. A plain class:
+/// a row reads it without being redrawn when it changes.
+///
+/// When the layout moves the row under the visible middle in the content, the thread's scroll view is moved by that move
+/// less SwiftUI's own part of it, so the row stays where the scroll puts it. A row moves in the content only when the
+/// layout above it changes, never when the thread scrolls, so the move to undo is the row's own move in the content.
+/// - **Per report** (`report`): the offset and its time, the offset before it, the scroll's own steps between the last
+///   reports (its own sets left out), the finger's place, and the app's flags. Nothing walks the rows.
+/// - **Per row move** (`moved`): a few comparisons. It acts only for the one row whose span, before the move, held the
+///   visible middle at the last report's offset.
+/// - **SwiftUI's part, from a same-pass report** (under 2 ms ago, not its own, not within a frame of a fix): `c` = the
+///   report's move less the scroll's own step in that frame: the finger's move under a finger, the glide's step in a
+///   glide, 0 at rest. If `c` is the move within the larger of 2 pt and a tenth, SwiftUI followed, and nothing is set.
+///   Otherwise `e = dy - c` when UIKit already shows the report's offset and `c` is part of the move in its direction,
+///   else `e = dy`. It is set at once, or, while no lazy row is on screen and the thread is moving, answered in what is
+///   drawn (the scroll view's layer shifted by it, render only), folded into the offset later.
+/// - **The late read, one frame after a set:** if UIKit's offset isn't where it was set, it is set again, only when
+///   nothing else can have moved it since.
+/// - **It does not act:** in an animated scroll the app asked for; while probing or out of sight; at rest stuck to the
+///   end (the bottom anchor's job); at rest before the first finger since the open; past either edge (against the larger
+///   of UIKit's height and the content's own); inside its own set; past 12 visible heights; after 8 fixes in one frame.
+@MainActor
+final class ThreadAnchor {
+    /// The named space the rows' frames are read in: the content's own (`ThreadContentHeight` sets it).
+    nonisolated static let space = "threadContent"
+
+    /// The content's own height (`ThreadContentHeight`), for the edges and the end's settle.
+    var content: CGFloat = -1
+    /// The scroll phase as the thread's phase handler last saw it.
+    private(set) var phaseNow: ScrollPhase = .idle
+
+    // The away flag's decision, once a run-loop turn (`askAway`).
+    private var awayDue: (() -> Void)?
+    private var awayScheduled = false
+
+    /// The end's settle (`TranscriptView.endSettle`), waiting for two frames with no height change.
+    var endSettleTask: Task<Void, Never>?
+
+    /// The lazy rows on screen now, and those laid out at least once (a first laying folds a shift).
+    private var lazyLive: Set<String> = []
+    private var lazyLaidOut: Set<String> = []
+    /// Each laid row's latest height, by id (`noteHeight`, from `ThreadRowWatch`), until it leaves the layout (`forget`):
+    /// the reach's row heights (`height(of:)`). Not dropped at an open: a row still laid keeps its height.
+    private var heights: [String: CGFloat] = [:]
+
+    #if os(iOS)
+    private weak var scrollView: UIScrollView?
+    private var lastOffset: CGFloat = .nan
+    private var prevOffset: CGFloat = .nan
+    private var lastAt: UInt64 = 0
+    /// When the report before the last came: a same-pass reading compares two reports one frame apart at most.
+    private var prevAt: UInt64 = 0
+    /// The thread's item count at the last two reports: a fall in the guesses keeps it.
+    private var lastItems = -1, prevItems = -1
+    /// A fall in the guesses: the held row moved up by more than a visible height with the item count kept. Nothing is
+    /// set then, the hold is dropped, and nothing is set until the content above the reader has grown back by the fall,
+    /// the scroll rests, or 500 ms pass. 0 when not settling.
+    private var settleSince: UInt64 = 0
+    private var settleNeed: CGFloat = 0, settleGot: CGFloat = 0
+    /// When the last fall came: a late read of a fix made before it keeps it.
+    private var fallAt: UInt64 = 0
+    /// A big move up of the held row, uncorrected when it came: the next report says whether its offset moved by about
+    /// the same (SwiftUI followed it, nothing on screen) or not (a fall, and the settle).
+    private struct FallCheck { let dy: CGFloat; let off: CGFloat; let id: String; let at: UInt64 }
+    private var fallCheck: FallCheck?
+    /// The drawing's shift now (points up), when it began, its steps, and when the last fold came (a late read of a fix
+    /// made before it keeps it).
+    private var shiftY: CGFloat = 0, shiftSince: UInt64 = 0, shiftSteps = 0
+    private var foldAt: UInt64 = 0, folds = 0
+    /// A fold asked for by a lazy row's laying, run outside SwiftUI's layout, and whether its run-loop observer is asked.
+    private var foldDue = false, foldDueScheduled = false
+    /// Each row's latest frame in the content (`known`), and from those, at each report, how far above and below its frame
+    /// each row holds the middle (half the gap to its neighbors; half a visible height for the outermost).
+    private var known: [String: CGRect] = [:]
+    private var spans: [String: (above: CGFloat, below: CGFloat)] = [:]
+    private var spansDirty = false
+    /// Offset sets of its own since the last fold, so the fold's check doesn't read them as a drop.
+    private var ownAfterFold: CGFloat = 0
+    private var lastReportOwn = false
+    /// The offset's step between the last two reports and between the two before, its own sets left out (`ownSince`);
+    /// and the finger's place at the last two reports under a finger.
+    private var lastStep: CGFloat = .nan, prevStep: CGFloat = .nan, ownSince: CGFloat = 0
+    /// The two steps before `prevStep`, and how many reports in a row came in a glide (`glideStep`).
+    private var prevStep2: CGFloat = .nan, prevStep3: CGFloat = .nan, glideReports = 0
+    /// The edge as it stood at the last two reports (the largest offset in bounds), for where the offset was before a
+    /// move (`beforeMove`); and which edge case the last `refusal` let through.
+    private var lastBottom: CGFloat = .nan, prevBottom: CGFloat = .nan, edgeCase = "none"
+    private var fingerLast: CGFloat?, fingerPrev: CGFloat?
+    /// The re-set: the last fix under a finger, checked at the next offset report, once.
+    private struct Pending { let id: String; let e: CGFloat; let setTo: CGFloat; let finger: CGFloat; let serial: Int; let pan: String; let at: UInt64 }
+    private var pending: Pending?
+    /// Fixes (row and serial) that were set again or set late, so neither acts after the other.
+    private var refixedKeys: Set<String> = [], lateFixedKeys: Set<String> = []
+    /// Whether the offset has moved yet under the current finger.
+    private var offMovedUnderFinger = false
+    private var fixing = false
+    private var touchedSinceOpen = false
+    private var probing = false, hidden = false, stuck = true
+    /// The offset the last fix at once set, and when: a report that lands on it is its own.
+    private var setTo: CGFloat = .nan
+    private var setAt: UInt64 = 0
+    /// Fixes within the current frame (reset when 4 ms have passed since the last), for the runaway cap.
+    private var fixesThisFrame = 0
+    private var lastFixAt: UInt64 = 0
+    /// Each row's count of fixes at once, so a late read knows whether the same row was fixed again since.
+    private var fixSerial: [String: Int] = [:]
+    private func r2(_ v: CGFloat) -> CGFloat { (v * 100).rounded() / 100 }
+    private func clock() -> UInt64 { DispatchTime.now().uptimeNanoseconds }
+    /// How far one correction may go: 12 visible heights.
+    private static let bound: CGFloat = 12
+    #endif
+
+    /// A new open: everything from the last one is dropped.
+    func opened() {
+        #if os(iOS)
+        lastOffset = .nan; prevOffset = .nan; lastReportOwn = false; touchedSinceOpen = false
+        prevAt = 0; lastAt = 0; lastItems = -1; prevItems = -1
+        settleSince = 0; settleNeed = 0; settleGot = 0; fallAt = 0
+        fallCheck = nil
+        shiftY = 0; shiftSince = 0; shiftSteps = 0; foldAt = 0; folds = 0
+        foldDue = false
+        ownAfterFold = 0
+        known = [:]; spans = [:]; spansDirty = false
+        lastStep = .nan; prevStep = .nan; ownSince = 0; fingerLast = nil; fingerPrev = nil
+        prevStep2 = .nan; prevStep3 = .nan; glideReports = 0; lastBottom = .nan; prevBottom = .nan; edgeCase = "none"
+        pending = nil; refixedKeys = []; lateFixedKeys = []
+        offMovedUnderFinger = false
+        setTo = .nan; fixesThisFrame = 0; fixSerial = [:]
+        #endif
+    }
+
+    /// The thread is handed another chat: a shift still drawn comes off the scroll view's layer, with nothing folded into
+    /// the offset (the new chat's place is its own).
+    func dropShift() {
+        #if os(iOS)
+        guard shiftSince != 0, let sv = scrollView else { return }
+        UIView.performWithoutAnimation { sv.layer.sublayerTransform = CATransform3DIdentity }
+        shiftY = 0; shiftSince = 0; shiftSteps = 0
+        #endif
+    }
+
+    #if os(iOS)
+    /// Why this place keeper holds the offset now, for the landing before the commit (`LandBeforeCommit`), or nil: a shift
+    /// on the drawing (`shift`), a fall's settle under way (`settle`), a fix under a finger waiting for its next report
+    /// (`pending`), a fix being set (`fixing`), a fold due (`fold`), or a fix set within the last two frames, whose late
+    /// read may still come (`fix`). A fall check alone holds nothing: it waits for the next report, which reads the
+    /// landing as the offset's move, as it reads the landing a frame later without this.
+    var holdsForLanding: String? {
+        if shiftSince != 0 || shiftY != 0 { return "shift" }
+        if settleSince != 0 { return "settle" }
+        if pending != nil { return "pending" }
+        if fixing { return "fixing" }
+        if foldDue { return "fold" }
+        if setAt != 0, clock() &- setAt < 34_000_000 { return "fix" }
+        return nil
+    }
+    #endif
+
+    /// The drawing's shift now (points up), for the away flag's drawn distance.
+    var shiftNow: CGFloat {
+        #if os(iOS)
+        return shiftY
+        #else
+        return 0
+        #endif
+    }
+
+    /// A row's height as last laid, where known, for the reach (`TranscriptView.reachStart`).
+    func height(of id: String) -> CGFloat? { heights[id] }
+    /// A row's height from its frame in the window (`ThreadRowWatch`).
+    func noteHeight(_ id: String, _ height: CGFloat) { heights[id] = height }
+
+    /// The content's first height, from inside a reader (`ThreadContentHeight`), to the hundredth of a point.
+    func noteContent(_ v: CGFloat) { content = (v * 100).rounded() / 100 }
+
+    // MARK: The lazy rows
+
+    /// A lazy row made and laid out for the first time: the end of the creep a shift was answering, so the fold is due.
+    func lazyLaid(_ id: String) {
+        guard !id.hasSuffix(".day"), lazyLaidOut.insert(id).inserted else { return }
+        #if os(iOS)
+        guard shiftSince != 0, !foldDue else { return }
+        foldDue = true
+        if !foldDueScheduled {
+            foldDueScheduled = true
+            let once = CFRunLoopObserverCreateWithHandler(kCFAllocatorDefault, CFRunLoopActivity.beforeWaiting.rawValue, false, 1_999_000) { [weak self] _, _ in
+                MainActor.assumeIsolated { self?.runDueFold("turn") }
+            }
+            CFRunLoopAddObserver(CFRunLoopGetMain(), once, .commonModes)
+        }
+        #endif
+    }
+    func lazyAppeared(_ id: String) { if !id.hasSuffix(".day") { lazyLive.insert(id) } }
+    func lazyGone(_ id: String) { lazyLive.remove(id) }
+
+    // MARK: The away flag's decision
+
+    /// The away flag's decision, once a run-loop turn, from a one-shot observer just before Core Animation's commit, ahead
+    /// of the anchor's own (order 1,998,000). Each ask replaces the turn's decision with the latest; the observer runs it
+    /// once.
+    func askAway(_ decide: @escaping () -> Void) {
+        awayDue = decide
+        guard !awayScheduled else { return }
+        awayScheduled = true
+        let once = CFRunLoopObserverCreateWithHandler(kCFAllocatorDefault, CFRunLoopActivity.beforeWaiting.rawValue, false, 1_998_000) { [weak self] _, _ in
+            MainActor.assumeIsolated { self?.runAway() }
+        }
+        CFRunLoopAddObserver(CFRunLoopGetMain(), once, .commonModes)
+    }
+    private func runAway() {
+        awayScheduled = false
+        let d = awayDue
+        awayDue = nil
+        d?()
+    }
+
+    /// A row left the layout: its frame no longer counts for the reach or the held spans.
+    func forget(_ id: String) {
+        heights[id] = nil
+        #if os(iOS)
+        known[id] = nil; spans[id] = nil; spansDirty = true
+        #endif
+    }
+
+    #if os(iOS)
+    /// Each known row's held span, from the rows' frames now: halfway across the gap to the row above and to the row below
+    /// (0 where rows touch or overlap), and half a visible height beyond the outermost.
+    private func computeSpans(_ sv: UIScrollView) {
+        let ins = sv.adjustedContentInset
+        let half = max(0, (sv.bounds.height - ins.top - ins.bottom) / 2)
+        let rows = known.sorted { $0.value.minY < $1.value.minY }
+        var out: [String: (above: CGFloat, below: CGFloat)] = [:]
+        for (i, r) in rows.enumerated() {
+            let above = i > 0 ? max(0, (r.value.minY - rows[i - 1].value.maxY) / 2) : half
+            let below = i + 1 < rows.count ? max(0, (rows[i + 1].value.minY - r.value.maxY) / 2) : half
+            out[r.key] = (above: min(above, half), below: min(below, half))
+        }
+        spans = out
+    }
+    #endif
+
+    func phase(_ was: ScrollPhase, _ now: ScrollPhase) {
+        phaseNow = now
+        #if os(iOS)
+        let finger = { (p: ScrollPhase) in p == .tracking || p == .interacting }
+        if shiftSince != 0, finger(now), !finger(was) { foldShift("finger") }
+        if shiftSince != 0, now == .idle, was != .idle { foldShift("rest") }
+        if finger(now), !finger(was) { touchedSinceOpen = true; offMovedUnderFinger = false }
+        if now == .idle, was != .idle, settleSince != 0 { settleEnd("rest") }
+        #endif
+    }
+
+    /// One offset report: kept for the visible middle and for the same-pass test.
+    func report(offset: CGFloat, _ metrics: ScrollMetrics, hidden out: Bool, items: Int) {
+        #if os(iOS)
+        let t0 = clock()
+        // The scroll's own steps: this report's move less its own sets since the last one. The two before `prevStep` are
+        // kept, and the reports in a row that came in a glide are counted.
+        prevStep3 = prevStep2; prevStep2 = prevStep
+        glideReports = phaseNow == .decelerating ? glideReports + 1 : 0
+        // The edge at this report and the one before (the largest offset in bounds, as `refusal` reckons it).
+        prevBottom = lastBottom
+        if let sv = metrics.scrollView {
+            lastBottom = max(sv.contentSize.height, content) + sv.adjustedContentInset.bottom - sv.bounds.height
+        } else {
+            lastBottom = .nan
+        }
+        prevStep = lastStep
+        lastStep = lastOffset.isNaN ? .nan : offset - lastOffset - ownSince
+        ownSince = 0
+        prevOffset = lastOffset
+        prevAt = lastAt
+        lastOffset = offset; lastAt = t0
+        prevItems = lastItems; lastItems = items
+        if settleSince != 0, t0 - settleSince > 500_000_000 { settleEnd("time") }
+        if fallCheck != nil { resolveFallCheck(offset, t0, via: "report") }
+        if foldDue { runDueFold("report") }
+        if shiftSince != 0 {
+            if lastItems != prevItems, prevItems >= 0 { foldShift("items") }
+            else if t0 &- shiftSince > 300_000_000 { foldShift("time") }
+        }
+        fingerPrev = fingerLast
+        if phaseNow == .tracking || phaseNow == .interacting, let sv = metrics.scrollView {
+            fingerLast = sv.panGestureRecognizer.location(in: sv.superview).y
+        } else {
+            fingerLast = nil
+        }
+        lastReportOwn = !setTo.isNaN && abs(offset - setTo) < 0.5 && t0 - setAt < 20_000_000
+        scrollView = metrics.scrollView
+        if spansDirty, let sv = metrics.scrollView { computeSpans(sv); spansDirty = false }
+        probing = metrics.probing; hidden = out
+        stuck = metrics.stickToBottom && metrics.distanceFromBottom < 4
+        // The pan's first applied move under this finger: the first report where the offset moved by the scroll.
+        let fingerPhase = phaseNow == .tracking || phaseNow == .interacting
+        let firstMove = fingerPhase && !offMovedUnderFinger && !lastStep.isNaN && abs(lastStep) >= 0.5
+        if firstMove { offMovedUnderFinger = true }
+        // The re-set: the last fix under a finger, checked once, at the first report 4 ms or more after the fix (a report
+        // in the fix's own pass can still carry the offset from before the set). If UIKit's live offset isn't the fix's
+        // target less the finger's move since, UIKit's pan dropped the fix, and it is set again now.
+        if let p = pending, let sv = scrollView, t0 &- p.at >= 4_000_000 {
+            pending = nil
+            let fingerNow = fingerLast ?? p.finger
+            let expected = p.setTo - (fingerNow - p.finger)
+            let live = sv.contentOffset.y
+            let dropped = expected - live
+            let why = refixRefusal(sv, p, offset: live, dropped: dropped, finger: fingerPhase)
+            // Nothing to do when the fix held (it is in the offset) or a re-set is refused (`refixRefusal`).
+            if abs(dropped) >= 0.5, why == nil {
+                let before = sv.contentOffset.y
+                fixing = true
+                sv.contentOffset.y = before + p.e
+                fixing = false
+                ownSince += sv.contentOffset.y - before
+                ownAfterFold += sv.contentOffset.y - before
+                refixedKeys.insert("\(p.id)#\(p.serial)")
+            }
+        }
+        #endif
+    }
+
+    #if os(iOS)
+    /// Ends a settle after a fall, with its reason (`regrown`, `rest` or `time`).
+    private func settleEnd(_ why: String) {
+        settleSince = 0; settleNeed = 0; settleGot = 0
+    }
+
+    /// A held-row move answered in what is drawn. The scroll view's layer draws its content `e` higher
+    /// (`sublayerTransform`, render only; no view or SwiftUI geometry changes), set plainly, so it joins the turn's own
+    /// transaction and is committed with the layout move it answers. The view's own layer takes no implicit animation
+    /// outside an animation block, and `performWithoutAnimation` keeps any block out.
+    private func applyShift(_ sv: UIScrollView, _ e: CGFloat) {
+        if shiftSince == 0 { shiftSince = clock() }
+        shiftY += e; shiftSteps += 1
+        UIView.performWithoutAnimation {
+            sv.layer.sublayerTransform = CATransform3DMakeTranslation(0, -shiftY, 0)
+        }
+    }
+
+    /// The fold a lazy row's laying asked for, run here, outside SwiftUI's layout: from the next offset report or the
+    /// run-loop observer, whichever comes first; the other finds nothing due.
+    private func runDueFold(_ via: String) {
+        if via == "turn" { foldDueScheduled = false }
+        guard foldDue else { return }
+        foldDue = false
+        foldShift("laid", via: via)
+    }
+
+    /// The drawing's shift folded into UIKit's offset, both in the turn's own transaction: the transform cleared and the
+    /// offset moved by the shift, so what is drawn does not move.
+    private func foldShift(_ why: String, via: String = "at") {
+        // Any fold clears a fold still due: what it would fold is folded now.
+        foldDue = false
+        guard shiftSince != 0 else { return }
+        let s = shiftY
+        shiftY = 0; shiftSince = 0; shiftSteps = 0
+        guard let sv = scrollView else {
+            return
+        }
+        let before = sv.contentOffset.y
+        UIView.performWithoutAnimation {
+            sv.layer.sublayerTransform = CATransform3DIdentity
+            fixing = true
+            sv.contentOffset.y = before + s
+            fixing = false
+        }
+        ownSince += sv.contentOffset.y - before
+        ownAfterFold = 0
+        foldAt = clock(); folds += 1
+        // One frame later: did UIKit keep the fold's offset? (A pan can drop a set.)
+        let target = sv.contentOffset.y, fingerAt = sv.panGestureRecognizer.location(in: sv.superview).y
+        let serial = folds, at = foldAt
+        Task { @MainActor [weak self] in
+            await FrameClock.next()
+            self?.foldRead(sv, s: s, target: target, fingerAt: fingerAt, serial: serial, at: at)
+        }
+    }
+
+    /// One frame after a fold: UIKit's live offset against the fold's target less the finger's move since. Held, or
+    /// dropped by the amount; a dropped fold is set again once, under the re-set's rules (under a finger, no other fold or
+    /// shift since, not settling, not at the edges or the end, only when what went missing is the fold within the slop's
+    /// 10 pt or a tenth, within the bound). Never schedules another read.
+    private func foldRead(_ sv: UIScrollView, s: CGFloat, target: CGFloat, fingerAt: CGFloat, serial: Int, at: UInt64) {
+        let fingerPhase = phaseNow == .tracking || phaseNow == .interacting
+        let fingerNow = fingerPhase ? sv.panGestureRecognizer.location(in: sv.superview).y : fingerAt
+        // Its own offset sets since the fold are in the live offset too, and are not a drop.
+        let own = ownAfterFold
+        let expected = target - (fingerNow - fingerAt) + own
+        let live = sv.contentOffset.y
+        let dropped = expected - live
+        guard abs(dropped) >= 0.5 else {
+            return
+        }
+        let height = max(sv.contentSize.height, content)
+        let top = -sv.adjustedContentInset.top
+        let bottom = height + sv.adjustedContentInset.bottom - sv.bounds.height
+        let ins = sv.adjustedContentInset
+        let bound: CGFloat = Self.bound * (sv.bounds.height - ins.top - ins.bottom)
+        let why: String?
+        if !fingerPhase { why = phaseNow == .decelerating ? "glide" : "nofinger" }
+        else if folds != serial { why = "foldedagain" }
+        else if shiftSince != 0 { why = "shifting" }
+        else if settleSince != 0 || fallCheck != nil { why = "settling" }
+        else if probing { why = "probing" }
+        else if hidden { why = "hidden" }
+        else if stuck { why = "end" }
+        else if live < top - 0.5 || live > bottom + 0.5 || live + s < top - 0.5 || live + s > bottom + 0.5 { why = "edge" }
+        else if abs(dropped - s) > max(10, 0.1 * abs(s)) { why = "unclear" }
+        else if abs(s) > bound { why = "big" }
+        else { why = nil }
+        if why != nil {
+            return
+        }
+        fixing = true
+        sv.contentOffset.y = live + s
+        fixing = false
+        ownSince += sv.contentOffset.y - live
+    }
+
+    /// A big move up, held for a check: the offset now (from the next report, or UIKit's live offset when no report came
+    /// within 20 ms) against the offset when it came. Moved by about the same as the row: SwiftUI followed it and nothing
+    /// moved on screen. Otherwise a fall: the settle starts from now.
+    private func resolveFallCheck(_ off: CGFloat, _ t0: UInt64, via: String) {
+        guard let f = fallCheck else { return }
+        fallCheck = nil
+        let moved = off - f.off
+        if abs(moved - f.dy) <= max(2, 0.1 * abs(f.dy)) {
+            return
+        }
+        fallAt = f.at
+        settleSince = t0; settleNeed = -f.dy; settleGot = 0
+    }
+
+    /// The reason not to set again a fix the pan dropped, if any: once per fix, under a finger only, not in a glide, not
+    /// after a late fix of the same row, not if the same row was fixed again since, not at the edges or the end, only when
+    /// what went missing is the fix (within the slop's 10 pt, or a tenth of the fix), and within the bound.
+    private func refixRefusal(_ sv: UIScrollView, _ p: Pending, offset: CGFloat, dropped: CGFloat, finger: Bool) -> String? {
+        if settleSince != 0 { return "settling" }
+        if !finger { return phaseNow == .decelerating ? "glide" : "nofinger" }
+        if probing { return "probing" }
+        if hidden { return "hidden" }
+        if stuck { return "end" }
+        let key = "\(p.id)#\(p.serial)"
+        if lateFixedKeys.contains(key) { return "afterlate" }
+        if fixSerial[p.id, default: 0] != p.serial { return "fixedagain" }
+        let height = max(sv.contentSize.height, content)
+        let top = -sv.adjustedContentInset.top
+        let bottom = height + sv.adjustedContentInset.bottom - sv.bounds.height
+        if offset < top - 0.5 || offset > bottom + 0.5 || offset + p.e < top - 0.5 || offset + p.e > bottom + 0.5 { return "edge" }
+        if abs(dropped - p.e) > max(10, 0.1 * abs(p.e)) { return "unclear" }
+        let ins = sv.adjustedContentInset
+        let bound: CGFloat = Self.bound * (sv.bounds.height - ins.top - ins.bottom)
+        if abs(p.e) > bound { return "big" }
+        return nil
+    }
+
+    private func panName(_ s: UIGestureRecognizer.State) -> String {
+        switch s {
+        case .possible: return "possible"
+        case .began: return "began"
+        case .changed: return "changed"
+        case .ended: return "ended"
+        case .cancelled: return "cancelled"
+        case .failed: return "failed"
+        @unknown default: return "other"
+        }
+    }
+
+    /// The reason not to act at once, if any.
+    private func refusal(_ sv: UIScrollView, at now: CGFloat, e: CGFloat, visible: CGFloat) -> String? {
+        if fixing { return "reentered" }
+        if phaseNow == .animating { return "animating" }
+        if probing { return "probing" }
+        if hidden { return "hidden" }
+        if phaseNow == .idle && stuck { return "end" }
+        if phaseNow == .idle && !touchedSinceOpen { return "beforetouch" }
+        let height = max(sv.contentSize.height, content)
+        let top = -sv.adjustedContentInset.top
+        let bottom = height + sv.adjustedContentInset.bottom - sv.bounds.height
+        // The edge is judged where the fix would land (`now + e`) and where the offset was before this move, not only
+        // where it is now. Landing past an edge is refused, and so is an offset already past one before the move (a
+        // bounce or an overscroll UIKit owns). An offset past the edge only because this move shrank the content under
+        // it, with `now + e` inside, is the fix's own case and goes on.
+        edgeCase = "none"
+        if now + e < top - 0.5 || now + e > bottom + 0.5 { return "edge target" }
+        if now < top - 0.5 || now > bottom + 0.5 {
+            let (beforeOff, beforeBottom) = beforeMove()
+            if beforeOff.isNaN || beforeBottom.isNaN || beforeOff < top - 0.5 || beforeOff > beforeBottom + 0.5 { return "edge before" }
+            edgeCase = "moved"
+        }
+        let bound: CGFloat = Self.bound * visible
+        if abs(e) > bound { return "big" }
+        if fixesThisFrame >= 8 { return "runaway" }
+        return nil
+    }
+
+    /// The offset and the edge before this move's pass. A report in this pass (within 2 ms) already carries the move's
+    /// new height, so the one before it is taken.
+    private func beforeMove() -> (CGFloat, CGFloat) {
+        clock() &- lastAt < 2_000_000 ? (prevOffset, prevBottom) : (lastOffset, lastBottom)
+    }
+
+    /// The glide's step for SwiftUI's part (`c`): `prevStep`, unless it stands out from the two glide steps before it by
+    /// more than 4 pt or a quarter (UIKit's glide stalled a frame, or caught one up): then the median of the three. Only
+    /// once five reports in a row came in the glide, so all three are glide steps.
+    private func glideStep() -> (CGFloat, Bool) {
+        guard glideReports >= 5, !prevStep2.isNaN, !prevStep3.isNaN else { return (prevStep, false) }
+        let m = [prevStep, prevStep2, prevStep3].sorted()[1]
+        return abs(prevStep - m) > max(4, 0.25 * abs(m)) ? (m, true) : (prevStep, false)
+    }
+    #endif
+
+    /// A row moved in the content: if it is the row under the visible middle, undo its move.
+    func moved(_ id: String, from old: CGRect, to new: CGRect) {
+        #if os(iOS)
+        let t0 = clock()
+        let dy = new.minY - old.minY
+        // Every row's latest frame, from which the held spans are worked out at the next report.
+        known[id] = new; spansDirty = true
+        guard dy != 0, old.height > 0, let sv = scrollView, !lastOffset.isNaN else { return }
+        let ins = sv.adjustedContentInset, visible = sv.bounds.height - ins.top - ins.bottom
+        let middle = lastOffset + ins.top + visible / 2
+        // The row nearest the middle is held. Each row's span reaches halfway across the gap to the next row above and
+        // below (as the rows were at the last report), so the spans tile the column and exactly one row holds any point,
+        // whatever the gap's size. The top-most and bottom-most known rows reach half a visible height beyond their edge.
+        let inside = old.minY <= middle && middle < old.maxY
+        let span = spans[id]
+        let held = inside || (span.map { old.minY - $0.above <= middle && middle < old.maxY + $0.below } ?? false)
+        guard held else { return }
+        // The settle after a fall: nothing is set; the held row's moves down count toward the content's regrowth.
+        if settleSince != 0 {
+            if dy > 0 { settleGot += dy }
+            if settleGot >= settleNeed - 1 { settleEnd("regrown") }
+            return
+        }
+        // A big move up waiting for the next report to say whether it was a fall: nothing else is read meanwhile.
+        if let f = fallCheck {
+            // No report within 20 ms (a still thread): UIKit's live offset decides instead.
+            if t0 &- f.at > 20_000_000 {
+                resolveFallCheck(sv.contentOffset.y, t0, via: "live")
+            } else {
+                return
+            }
+            if settleSince != 0 {
+                if dy > 0 { settleGot += dy }
+                if settleGot >= settleNeed - 1 { settleEnd("regrown") }
+                return
+            }
+        }
+        let now = sv.contentOffset.y
+        // A report within a frame of a fix of its own may still carry the offset from before it, so it is never read as
+        // SwiftUI's own following.
+        let recentFix = !setTo.isNaN && t0 - setAt < 20_000_000
+        // The two reports compared must be one frame apart at most: an older one carries moves never reported (the
+        // open's follow at the end, the finger coming down), not SwiftUI's part.
+        let fresh = prevAt != 0 && lastAt &- prevAt < 20_000_000
+        let samePass = t0 - lastAt < 2_000_000 && fresh && !prevOffset.isNaN && !lastReportOwn && !recentFix
+        let reportMove = samePass ? lastOffset - prevOffset : 0
+        // SwiftUI's part of a same-pass report: its move less the scroll's own step in that frame. The step is the
+        // finger's move between the two reports under a finger (0 in the first report after it comes down), the step of
+        // the two reports before in a glide (the last finger step, in a glide's first report), 0 at rest.
+        var step: CGFloat = 0, stepFrom = "none"
+        if samePass {
+            switch phaseNow {
+            case .tracking, .interacting:
+                if let f1 = fingerLast, let f0 = fingerPrev { step = -(f1 - f0); stepFrom = "finger" } else { stepFrom = "fingerfirst" }
+            case .decelerating:
+                // A `prevStep` that stands out from the two glide steps before it gives way to the median of the three.
+                if !prevStep.isNaN {
+                    let (s, odd) = glideStep()
+                    step = s; stepFrom = odd ? "glidemedian" : "glide"
+                } else { stepFrom = "glidefirst" }
+            default:
+                stepFrom = "rest"
+            }
+        }
+        // A same-pass report that moved nothing carries no step and no correction: the glide had not stepped yet in it, so
+        // the step is not taken from it, and SwiftUI's part is 0. The first report under a new finger carries no SwiftUI
+        // part either: what moved in it is the finger coming down.
+        let c = samePass && stepFrom != "fingerfirst" && abs(reportMove) >= 0.5 ? reportMove - step : 0
+        // UIKit already shows the report's offset: SwiftUI's part, if any, is in UIKit already.
+        let shows = samePass && abs(now - lastOffset) < 0.5
+        let followed = samePass && abs(c - dy) <= max(2, 0.1 * abs(dy))
+        let sameWay = c != 0 && (c > 0) == (dy > 0)
+        let cPart: CGFloat = shows && sameWay && abs(c) < abs(dy) ? c : 0
+        let e = dy - cPart
+        let pan = panName(sv.panGestureRecognizer.state)
+        let underFinger = phaseNow == .tracking || phaseNow == .interacting
+        if t0 - lastFixAt > 4_000_000 { fixesThisFrame = 0 }
+        // A fall in the guesses is a big move up (over a visible height, the item count kept) that nothing corrected.
+        // Followed by a same-pass report, or already in UIKit's live offset, it moved nothing on screen: not a fall.
+        // Otherwise the next report decides: its offset moved by about dy, followed; else a fall.
+        if dy < 0, -dy > visible, lastItems >= 0, lastItems == prevItems {
+            let uikitMove = now - lastOffset
+            let uikitFollowed = abs(uikitMove - dy) <= max(2, 0.1 * abs(dy))
+            if followed || uikitFollowed {
+                return
+            }
+            if shiftSince != 0 { foldShift("fall") }
+            fallCheck = FallCheck(dy: dy, off: lastOffset, id: id, at: t0)
+            pending = nil
+            return
+        }
+        if refusal(sv, at: now, e: e, visible: visible) != nil { return }
+        if followed {
+            return
+        }
+        guard abs(e) >= 0.5 else { return }
+        // While no lazy row is on screen and the thread is moving, the move is answered in what is drawn, not in the
+        // offset, so the scroll geometry closes on the unlaid rows and SwiftUI lays them. Not in the edge's own case: a
+        // shift would leave the offset past the end for UIKit's bounce to pull back, so the offset itself is set, back
+        // inside.
+        if lazyLive.isEmpty, phaseNow != .idle, edgeCase != "moved" {
+            if abs(shiftY + e) <= Self.bound * visible {
+                applyShift(sv, e)
+                return
+            }
+            foldShift("bound")
+        }
+        fixing = true
+        sv.contentOffset.y = now + e
+        fixing = false
+        setTo = sv.contentOffset.y; setAt = t0; lastFixAt = t0; fixesThisFrame += 1
+        ownSince += setTo - now
+        ownAfterFold += setTo - now
+        fixSerial[id, default: 0] += 1
+        if underFinger {
+            pending = Pending(id: id, e: setTo - now, setTo: setTo, finger: sv.panGestureRecognizer.location(in: sv.superview).y,
+                              serial: fixSerial[id, default: 0], pan: pan, at: t0)
+        }
+        lateRead(id, sv, want: setTo, serial: fixSerial[id, default: 0], finger: sv.panGestureRecognizer.location(in: sv.superview).y, at: t0)
+        #endif
+    }
+
+    #if os(iOS)
+    /// One frame later: is the offset still where the fix wanted it? If not, set it again only when nothing but SwiftUI or
+    /// UIKit can have moved it since. Never schedules another read.
+    private func lateRead(_ id: String, _ sv: UIScrollView, want: CGFloat, serial: Int, finger: CGFloat, at: UInt64) {
+        Task { @MainActor [weak self] in
+            await FrameClock.next()
+            guard let self else { return }
+            let off = sv.contentOffset.y, r = want - off
+            guard abs(r) >= 0.5 else { return }
+            let moved = (self.phaseNow == .tracking || self.phaseNow == .interacting)
+                && abs(sv.panGestureRecognizer.location(in: sv.superview).y - finger) >= 0.5
+            let ins = sv.adjustedContentInset
+            let bound: CGFloat = Self.bound * (sv.bounds.height - ins.top - ins.bottom)
+            let why: String?
+            if self.refixedKeys.contains("\(id)#\(serial)") { why = "refixed" }
+            else if self.settleSince != 0 || (self.fallAt != 0 && at < self.fallAt) { why = "fall" }
+            else if self.foldAt != 0 && at < self.foldAt { why = "fold" }
+            else if self.phaseNow == .decelerating { why = "glide" }
+            else if self.phaseNow == .animating { why = "animating" }
+            else if self.probing { why = "probing" }
+            else if self.hidden { why = "hidden" }
+            else if self.phaseNow == .idle && (self.stuck || !self.touchedSinceOpen) { why = self.stuck ? "end" : "beforetouch" }
+            else if moved { why = "fingermoved" }
+            else if self.fixSerial[id, default: 0] != serial { why = "fixedagain" }
+            else if abs(r) > bound { why = "big" }
+            else { why = nil }
+            if why != nil {
+                return
+            }
+            self.fixing = true
+            sv.contentOffset.y = want
+            self.ownSince += sv.contentOffset.y - off
+            self.ownAfterFold += sv.contentOffset.y - off
+            self.fixing = false
+            self.lateFixedKeys.insert("\(id)#\(serial)")
+        }
+    }
+    #endif
+}
 
 /// The whole tool call on its own page: the command or arguments and the output, as text you
 /// can select by range and share.
@@ -3035,7 +4516,7 @@ struct ToolCardView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         // A painted card, not glass: a thread can hold dozens of these, and each live glass
         // layer is composited every frame while the thread scrolls (the stutter on device).
-        // The opened part is revealed by the card growing, inside the card (Matt, 2026-10-11:
+        // The opened part is revealed by the card growing, inside the card (2026-10-11:
         // tool expands need a proper animation; it faded in before).
         .clipShape(.rect(cornerRadius: compact ? 10 : 14))
         .background(Color(.secondarySystemGroupedBackground), in: .rect(cornerRadius: compact ? 10 : 14))

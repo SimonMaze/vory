@@ -184,6 +184,67 @@ def coding_history(rounds: int, end: float) -> list[dict]:
     return out
 
 
+# MOCK_TALL=near (#704): a chat whose replies include some many screens tall, for checks of a thread
+# that meets a very tall row in a scroll. Made-up content: generic hosts and numbers only.
+_TALL_HOSTS = ("web-01", "web-02", "db-01", "cache-01", "build-01", "edge-02")
+_TALL_PARA = ("The check ran over every row once and kept what it measured, so the second pass had nothing left to do. "
+              "Nothing in the numbers stands out against yesterday's, and the few differences are inside the usual range for this time of day. "
+              "The next check runs in the morning; until then there is nothing that needs a hand.")
+
+
+def _tall_table(n: int, rows: int) -> str:
+    """A wide markdown table, six columns of long cells, so it wraps at a narrow width (the table wrap is on by default)."""
+    head = "| Host | Service | Check that ran | Result in words | Since yesterday | What to do next |\n|---|---|---|---|---|---|\n"
+    body = "".join(f"| {_TALL_HOSTS[(n + k) % 6]} | service-{(n * 7 + k) % 23:02d} | nightly health and log scan {k + 1} | "
+                   f"passed with {(n + k) % 5} warnings, none new | {(n * 3 + k) % 9} more requests per second | "
+                   f"nothing needed until the Thursday window |\n" for k in range(rows))
+    return head + body
+
+
+def _tall_code(lines: int) -> str:
+    """A fenced block of long shell lines, so it wraps at a narrow width (the code wrap is on by default)."""
+    return "```bash\n" + "\n".join(
+        f"journalctl -u service-{n % 23:02d} --since '2026-10-0{1 + n % 9} 0{n % 10}:00' --until now --no-pager | grep -c 'health check passed for batch {n}'"
+        for n in range(lines)) + "\n```"
+
+
+def _tall_ordinary(out: list, rid: int, t: float, n: int) -> int:
+    """One short round: a one-line question and a two-line answer."""
+    h = _TALL_HOSTS[n % 6]
+    out.append({"role": "user", "text": f"Short check {n + 1}: anything new on {h}?", "timestamp": t, "row_id": rid}); rid += 1
+    out.append({"role": "assistant", "text": f"Nothing new on {h}. The last run finished in {20 + n % 40} s and every check passed.",
+                "timestamp": t + 5, "row_id": rid}); rid += 1
+    return rid
+
+
+def tall_history(end: float) -> list[dict]:
+    """A chat with very tall rows (MOCK_TALL=near), oldest first, ending at `end`. Every message is one row: no tool
+    rows and no reasoning. 30 short rounds (60 rows), then the tall block (8 rows), then 15 short rounds (30 rows) at
+    the end: 98 rows. The tallest reply sits a few screens above the end, so a scroll toward older rows from the end
+    meets it in its second or third fling.
+    The tall block, oldest first: a question; a reply with a wide table of 8 rows; a question; a reply with a code
+    block of 80 long lines; a question; a reply with a wide table of 12 rows; a question; the tallest reply, 34
+    paragraphs, several thousand points tall at a narrow phone width. The tallest reply is the newest of the block,
+    so only the short rows below it lie between it and the end."""
+    out, rid = [], 1
+    t = end - 100000
+    below = 15
+    for n in range(30):
+        rid = _tall_ordinary(out, rid, t, n); t += 600
+    tall = "\n\n".join(f"Paragraph {p + 1} of the long write-up. {_TALL_PARA}" for p in range(34))
+    block = [("Which hosts had warnings this week?", "Only the hosts with warnings:\n\n" + _tall_table(2, 8)),
+             ("The commands you used?", "The commands, in the order I ran them:\n\n" + _tall_code(80)),
+             ("And the services as a table?", "The services, all hosts:\n\n" + _tall_table(1, 12)),
+             ("Write up the whole week on every host, in full.", tall)]
+    for q, a in block:
+        out.append({"role": "user", "text": q, "timestamp": t, "row_id": rid}); rid += 1
+        out.append({"role": "assistant", "text": a, "timestamp": t + 5, "row_id": rid}); rid += 1
+        t += 600
+    for n in range(30, 30 + below):
+        rid = _tall_ordinary(out, rid, t, n); t += 600
+    return out
+
+
 DELEGATE_PART_1 = """Two separate questions there, so I'll hand each to a helper and pull the answers together."""
 
 DELEGATE_PART_2 = """Both are back. The nginx side has one stale block, `staging.example`, pointing at an
@@ -3601,6 +3662,10 @@ class Gateway:
                     coding = int(os.environ.get("MOCK_CODING", "0") or 0)
                     if coding > 0:
                         live.history = coding_history(coding, row["last_active"])
+                    # MOCK_TALL=near (#704): a chat with very tall replies (tall_history). Any other word: nothing
+                    # changes.
+                    if os.environ.get("MOCK_TALL", "") == "near":
+                        live.history = tall_history(row["last_active"])
                     # MOCK_LONG=n: the same exchange n times over, for scroll-performance checks.
                     reps = int(os.environ.get("MOCK_LONG", "1") or 1)
                     if reps > 1:

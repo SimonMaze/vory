@@ -316,7 +316,7 @@ public final class ChatSession: @MainActor Identifiable, ChatIdentity {
         }
     }
     /// "Syncing…" is for a chat with nothing to show yet; with the cached transcript on screen
-    /// the attach runs silently behind the title (Matt, 2026-10-12: "a Syncing… status, speed
+    /// the attach runs silently behind the title (2026-10-12: "a Syncing… status, speed
     /// that up").
     public var showsSyncing: Bool { isResuming && items.isEmpty }
     @ObservationIgnored private var _resumeError: String?
@@ -496,7 +496,7 @@ public final class ChatSession: @MainActor Identifiable, ChatIdentity {
 
     /// The model the chat last ran with (this device's cache), or its bot's default, until the
     /// attach brings `info`: the chip said "Model" for the first frames of every reopened chat
-    /// (Matt, 2026-10-11). The bot's default is read live: the profiles may land after the open.
+    /// (2026-10-11). The bot's default is read live: the profiles may land after the open.
     private var cachedModel: String?
     public var modelName: String { pendingModel?.model ?? info?.model ?? cachedModel ?? runtime.profiles.first { $0.name == profileName }?.model ?? "" }
     public var subtitle: String {
@@ -841,6 +841,102 @@ public final class ChatSession: @MainActor Identifiable, ChatIdentity {
     /// streamed (its rows named on the way in) came back under new ids in the next snapshot, and
     /// the thread took out every one of those rows and put it back. Rows are paired in order,
     /// looking a few rows ahead for the notes only this device shows.
+    #if os(iOS)
+    /// On iPhone and iPad, rows that are surely the same are paired first, in order. From the top,
+    /// as long as the two lists agree row for row (one id, or the same command for a tool, or the
+    /// same words), each row keeps the shown row's id; a note only this device shows is passed over.
+    /// After that, where the lists differ, a tool row whose command (its name and its context)
+    /// appears exactly once among the snapshot's rows there and exactly once among the rows shown
+    /// there is paired with that row. Every other row is then paired as before, by what it says (a
+    /// tool by its name), only within the stretch between the rows already paired, so no pair
+    /// crosses one. A tool row missing on one side (a running tool a snapshot left out) used to put
+    /// every later tool of the same name onto its neighbor's id; now it stays apart.
+    public nonisolated static func keepingIDs(_ built: [TranscriptItem], from shown: [TranscriptItem]) -> [TranscriptItem] {
+        func said(_ item: TranscriptItem) -> String? {
+            switch item.kind {
+            case .user(let t, _): return "u" + t.trimmingCharacters(in: .whitespacesAndNewlines)
+            // A step that only thought goes by its reasoning's start (by its empty words every such
+            // step said the same); the start only, as a step's reasoning can run to megabytes.
+            case .assistant(_, let r, false) where item.isThinkingOnly: return "r" + StreamAssembler.normalized(String((r ?? "").prefix(600))).prefix(300)
+            case .assistant(let t, _, let streaming): return streaming ? nil : "a" + t.trimmingCharacters(in: .whitespacesAndNewlines)
+            case .tool(let act): return "t" + act.name
+            default: return nil
+            }
+        }
+        // A tool row's command: its name and its context with each run of white space made one space,
+        // the first 80 characters (a live context may be the whole command, a stored one a preview of
+        // it). Nil for any other row and for a tool with no context.
+        func command(_ item: TranscriptItem) -> String? {
+            guard case .tool(let act) = item.kind, let context = act.context else { return nil }
+            let words = context.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
+            guard !words.isEmpty else { return nil }
+            return act.name + "\n" + String(words.prefix(80))
+        }
+        // Two rows that are surely the same: one id, or for a tool the same command, or for any other
+        // row the same words.
+        func same(_ a: TranscriptItem, _ b: TranscriptItem) -> Bool {
+            if a.id == b.id { return true }
+            if case .tool = a.kind { let c = command(a); return c != nil && c == command(b) }
+            if case .tool = b.kind { return false }
+            let words = said(a)
+            return words != nil && words == said(b)
+        }
+        var paired: [Int: Int] = [:]
+        // Where the lists agree from the top, row for row. A shown row that says nothing and is not a
+        // tool (a note only this device shows) is passed over; anything else that differs ends it.
+        var a = 0, b = 0
+        while a < built.count, b < shown.count {
+            if same(built[a], shown[b]) {
+                paired[a] = b
+                a += 1
+                b += 1
+            } else if said(shown[b]) == nil {
+                b += 1
+            } else {
+                break
+            }
+        }
+        // Past that, a command once on each side pairs its two rows, kept only in order.
+        var builtCount: [String: Int] = [:], shownCount: [String: Int] = [:], shownAt: [String: Int] = [:]
+        for row in built[a...] { if let c = command(row) { builtCount[c, default: 0] += 1 } }
+        for j in shown.indices[b...] { if let c = command(shown[j]) { shownCount[c, default: 0] += 1; shownAt[c] = j } }
+        var last = b - 1
+        for i in built.indices[a...] {
+            guard let c = command(built[i]), builtCount[c] == 1, shownCount[c] == 1, let j = shownAt[c], j > last else { continue }
+            paired[i] = j
+            last = j
+        }
+        // Each row's stretch ends at the shown row the next row already paired took (the list's end after the last).
+        var end = Array(repeating: shown.count, count: built.count)
+        var bound = shown.count
+        for i in built.indices.reversed() {
+            end[i] = bound
+            if let j = paired[i] { bound = j }
+        }
+        var out = built
+        var next = 0
+        var taken = Set<String>()
+        for i in out.indices {
+            if let j = paired[i] {
+                if !taken.contains(shown[j].id) {
+                    out[i].id = shown[j].id
+                } else if taken.contains(out[i].id) {
+                    out[i].id += "-\(i)"
+                }
+                next = j + 1
+            } else if let words = said(out[i]),
+               let j = shown[next..<max(next, end[i])].prefix(6).firstIndex(where: { said($0) == words }), !taken.contains(shown[j].id) {
+                out[i].id = shown[j].id
+                next = j + 1
+            } else if taken.contains(out[i].id) {
+                // Its own id went to an earlier row (rows shifted under it): never two rows with one id.
+                out[i].id += "-\(i)"
+            }
+            taken.insert(out[i].id)
+        }
+        return out
+    }
+    #else
     public nonisolated static func keepingIDs(_ built: [TranscriptItem], from shown: [TranscriptItem]) -> [TranscriptItem] {
         func said(_ item: TranscriptItem) -> String? {
             switch item.kind {
@@ -869,6 +965,7 @@ public final class ChatSession: @MainActor Identifiable, ChatIdentity {
         }
         return out
     }
+    #endif
 
     /// Snapshots whose rows are being made off the main actor; events wait meanwhile.
     private var snapshotsBuilding = 0

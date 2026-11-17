@@ -42,6 +42,24 @@ import Testing
         #expect(other != context(lastID: "a39"))
     }
 
+    #if os(iOS)
+    @Test func theTailIsExactRowsAndTheThreadsOwnBoundaryStandsWhileItLeavesAtLeastThat() {
+        let tail = TranscriptRowModel.tailRows
+        #expect(TranscriptRowModel.tailStart(tail - 1) == 0)
+        #expect(TranscriptRowModel.tailStart(tail * 2) == tail)
+        #expect(TranscriptRowModel.tailStart(tail * 2 + 5) == tail + 5)
+        // The thread's own boundary holds however many rows come after it: they cross into the lazy stack out of sight
+        // or at the backstop, at rest (`settleTail`), not here (#704).
+        #expect(TranscriptRowModel.split(count: tail * 3, tailFrom: tail) == tail)
+        #expect(TranscriptRowModel.split(count: tail + TranscriptRowModel.backstop + 1, tailFrom: tail) == tail)
+        // A boundary past where the tail would start is not honoured.
+        #expect(TranscriptRowModel.split(count: tail * 4, tailFrom: tail * 3 + 2) == TranscriptRowModel.tailStart(tail * 4))
+        // A long turn of tool calls (sixty rows) streams without moving the boundary: rows that
+        // crossed mid-turn were laid out from the lazy stack's guesses, over their neighbours.
+        #expect(TranscriptRowModel.split(count: tail + 60, tailFrom: tail) == tail)
+    }
+    #else
+    /// The Mac keeps the tail as before the fix (`ThreadFix`): whole blocks, and the cap.
     @Test func theTailBoundaryMovesByWholeBlocksAndTheThreadsOwnStandsWhileItIsSensible() {
         let block = TranscriptRowModel.tailBlock
         #expect(TranscriptRowModel.tailStart(block - 1) == 0)
@@ -51,13 +69,14 @@ import Testing
         #expect(TranscriptRowModel.split(count: block * 3, tailFrom: block) == block)
         // Too many rows piled up past it: the blocks take over, a few screens from the end (#410).
         let cap = TranscriptRowModel.tailCap
-        #expect(TranscriptRowModel.split(count: block + cap + 1, tailFrom: block) == TranscriptRowModel.tailStart(block + cap + 1, keep: TranscriptRowModel.tailKeep))
+        #expect(TranscriptRowModel.split(count: block + cap + 1, tailFrom: block) == TranscriptRowModel.blockStart(block + cap + 1, keep: TranscriptRowModel.tailKeep))
         // A boundary past where the blocks would start is not honoured either.
         #expect(TranscriptRowModel.split(count: block * 4, tailFrom: block * 3 + 2) == TranscriptRowModel.tailStart(block * 4))
         // A long turn of tool calls (sixty rows) streams without moving the boundary: rows that
         // crossed mid-turn were laid out from the lazy stack's guesses, over their neighbours.
         #expect(TranscriptRowModel.split(count: block + 60, tailFrom: block) == block)
     }
+    #endif
 
     /// Two items with one id (a tool call the gateway sent twice) are still two rows with ids of
     /// their own: rows that share an id can be laid out one over the other.

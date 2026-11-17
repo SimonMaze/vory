@@ -66,40 +66,34 @@ import Testing
 #if os(iOS)
 /// Where the phone's thread stops being lazy.
 @Suite struct TranscriptTailTests {
-    @Test func aShortThreadIsNotLazyAndALongOneKeepsAtLeastABlockAtItsEnd() {
+    @Test func aShortThreadIsNotLazyAndALongOneKeepsExactlyItsTailAtItsEnd() {
+        #expect(TranscriptRowModel.tailRows == 13)
         #expect(TranscriptRowModel.tailStart(0) == 0)
-        #expect(TranscriptRowModel.tailStart(31) == 0)
-        #expect(TranscriptRowModel.tailStart(32) == 16)
-        #expect(TranscriptRowModel.tailStart(500) == 480)
-        for n in 0...200 { #expect(n - TranscriptRowModel.tailStart(n) < 2 * TranscriptRowModel.tailBlock) }
+        #expect(TranscriptRowModel.tailStart(13) == 0)
+        #expect(TranscriptRowModel.tailStart(14) == 1)
+        #expect(TranscriptRowModel.tailStart(500) == 487)
+        for n in 0...200 { #expect(n - TranscriptRowModel.tailStart(n) == min(n, TranscriptRowModel.tailRows)) }
     }
-    @Test func aTurnLongerThanTheEndHoldsLetsOnlyRowsFarUpCross() {
-        // The boundary set at 16 holds while the end grows to the cap.
-        #expect(TranscriptRowModel.split(count: 112, tailFrom: 16) == 16)
-        // Past it, a few screens of rows stay out of the lazy stack, never just a block (#410).
-        for n in 113...600 {
-            let split = TranscriptRowModel.split(count: n, tailFrom: 16)
-            #expect(n - split >= TranscriptRowModel.tailKeep, "only \(n - split) rows at the end of \(n)")
-            #expect(n - split < TranscriptRowModel.tailKeep + TranscriptRowModel.tailBlock)
-            #expect(split % TranscriptRowModel.tailBlock == 0)
-        }
-        // No boundary yet, or one past the rows (they went): by whole blocks, as before.
-        #expect(TranscriptRowModel.split(count: 500, tailFrom: nil) == 480)
-        #expect(TranscriptRowModel.split(count: 40, tailFrom: 64) == 16)
+    @Test func aTurnLongerThanTheEndHoldsLetsNoRowCrossInTheSplit() {
+        // The boundary set at 16 holds however long the end grows: rows cross only out of sight or at the backstop, at
+        // rest (`settleTail`), never in `split`, so none is laid out from the lazy stack's guesses mid-turn (#410, #704).
+        for n in 29...600 { #expect(TranscriptRowModel.split(count: n, tailFrom: 16) == 16) }
+        // No boundary yet, or one past the rows (they went): exactly the tail.
+        #expect(TranscriptRowModel.split(count: 500, tailFrom: nil) == 487)
+        #expect(TranscriptRowModel.split(count: 40, tailFrom: 64) == 27)
     }
 
-    @Test func theThreadsOwnBoundaryStandsUntilItLeavesTooMuchOrTooLittle() {
+    @Test func theThreadsOwnBoundaryStandsUntilItLeavesLessThanTheTail() {
         // A thread that has not set one yet.
-        #expect(TranscriptRowModel.split(count: 90, tailFrom: nil) == 64)
+        #expect(TranscriptRowModel.split(count: 90, tailFrom: nil) == 77)
         // Rows arriving since the boundary was set: it stays where it is.
         #expect(TranscriptRowModel.split(count: 60, tailFrom: 16) == 16)
-        // A long history arriving in a thread that had none: whole blocks, not every row at once,
-        // with a few screens kept at the end until the thread rests (#410).
-        #expect(TranscriptRowModel.split(count: 500, tailFrom: 0) == TranscriptRowModel.tailStart(500, keep: TranscriptRowModel.tailKeep))
-        // More rows piled up than the end may hold: the same.
-        #expect(TranscriptRowModel.split(count: 16 + TranscriptRowModel.tailCap + 1, tailFrom: 16) == TranscriptRowModel.tailStart(16 + TranscriptRowModel.tailCap + 1, keep: TranscriptRowModel.tailKeep))
+        // A long history arriving under a boundary at the top: it stays; the next open sets it again (#704).
+        #expect(TranscriptRowModel.split(count: 500, tailFrom: 0) == 0)
+        // More rows piled up than the backstop: still the same here (the backstop crosses them at rest, `settleTail`).
+        #expect(TranscriptRowModel.split(count: 16 + TranscriptRowModel.backstop + 1, tailFrom: 16) == 16)
         // A shorter thread than the boundary was set for.
-        #expect(TranscriptRowModel.split(count: 20, tailFrom: 48) == 0)
+        #expect(TranscriptRowModel.split(count: 20, tailFrom: 48) == 7)
     }
 }
 
